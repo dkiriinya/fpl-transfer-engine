@@ -105,7 +105,7 @@ class OptimizeResponse(BaseModel):
 
 def get_connection():
     """Create a new psycopg2 connection to Neon PostgreSQL."""
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=5, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def fetch_player_pool(start_gw: int, horizon: int = 1) -> List[dict]:

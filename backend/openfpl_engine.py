@@ -26,7 +26,7 @@ FPL_BASE = "https://fantasy.premierleague.com/api"
 
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=5, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def fetch_live_fpl_data() -> Tuple[dict, list]:

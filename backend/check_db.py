@@ -7,25 +7,59 @@ for t in cur.fetchall():
     print(t)
 
 cur.execute("""
-    SELECT p.id, p.web_name, p.team_id, t.short_name, p.now_cost, p.status, p.chance_of_playing,
-           pp.gameweek, pp.expected_points, pp.expected_minutes
+    SELECT p.id, p.web_name, t.short_name as team, p.position, p.now_cost, p.status, p.chance_of_playing,
+           pp.expected_points, pp.expected_minutes
     FROM players p
     JOIN teams t ON p.team_id = t.id
-    LEFT JOIN player_projections pp ON pp.player_id = p.id
-    WHERE p.web_name IN ('Rice', 'Mainoo', 'Rogers')
-    ORDER BY p.web_name, pp.gameweek;
+    LEFT JOIN player_projections pp ON pp.player_id = p.id AND pp.gameweek = 5
+    WHERE p.web_name ILIKE '%gro%'
+    ORDER BY p.web_name;
 """)
-print('--- PLAYERS ---')
+print('--- GROSS ---')
 for r in cur.fetchall():
     print(dict(r))
 
-user_squad_ids = [496, 8, 390, 4, 356, 124, 427, 40, 368, 165, 411, 497, 346, 277, 547]
-pool_by_id = {p['player_id']: p for p in pool}
+from main import fetch_player_pool, solve_chip_plan, OptimizeRequest
 
-print("\n--- USER CURRENT SQUAD IN DB ---")
-for pid in user_squad_ids:
-    if pid in pool_by_id:
-        p = pool_by_id[pid]
-        print(f"ID {p['player_id']:3d} | {p['web_name']:15s} | {p['position']} | {p['team']} | £{p['price']:4.1f}m | xP: {p['projected_points']}")
-    else:
-        print(f"ID {pid:3d} NOT FOUND IN POOL")
+# Let's get the user squad from FPL or database
+# We can check what picks were sent in the optimize request
+# Or fetch picks from FPL API for entry 8796308 gw 5
+import httpx
+res = httpx.get("https://fantasy.premierleague.com/api/entry/8796308/event/4/picks/")
+if not res.is_success:
+    res = httpx.get("https://fantasy.premierleague.com/api/entry/8796308/event/3/picks/")
+picks_data = res.json()
+current_squad = [p["element"] for p in picks_data["picks"]]
+bank = picks_data.get("entry_history", {}).get("bank", 0) / 10.0
+
+req = OptimizeRequest(
+    team_id=8796308,
+    gameweek=5,
+    current_squad=current_squad,
+    bank=bank,
+    free_transfers=1,
+    chip="none",
+    horizon=1
+)
+
+pool = fetch_player_pool(5, 1)
+plan = solve_chip_plan(req, pool, "none")
+
+print("=== STARTING XI ===")
+for p in plan["starting_xi"]:
+    print(f"{p.position:3s} | {p.web_name:15s} | {p.team:3s} | xP: {p.projected_points:.2f} | Price: {p.price:.1f} | C: {p.is_captain} | VC: {p.is_vice_captain}")
+
+print("\n=== BENCH ===")
+for p in plan["bench"]:
+    print(f"{p.position:3s} | {p.web_name:15s} | {p.team:3s} | xP: {p.projected_points:.2f} | Price: {p.price:.1f}")
+
+print("\n=== TRANSFERS ===")
+for t in plan["transfers"]:
+    print(f"OUT: {t.out.web_name} ({t.out.projected_points:.2f}) -> IN: {t.in_.web_name} ({t.in_.projected_points:.2f}) [Gain: {t.points_gain:.2f}]")
+
+
+
+
+
+
+
