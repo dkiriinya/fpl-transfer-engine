@@ -6,10 +6,12 @@ Standard, Wildcard, Free Hit, Bench Boost, Triple Captain.
 """
 
 import os
+import time
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Tuple, Any
 
+import httpx
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
@@ -39,6 +41,7 @@ class OptimizeRequest(BaseModel):
     wildcard_active: bool = False
     chip: Optional[str] = "none"   # "none" | "wildcard" | "freehit" | "benchboost" | "triplecaptain"
     horizon: int = 1               # Planning horizon in gameweeks: 1, 3, 5
+    selling_prices: Optional[Dict[int, float]] = None
 
 
 class PlayerRec(BaseModel):
@@ -163,6 +166,96 @@ def fetch_player_pool(start_gw: int, horizon: int = 1) -> List[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FPL Selling Price Calculation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_bootstrap_cost_cache: Dict[int, float] = {}
+_bootstrap_cache_time: float = 0.0
+
+def get_initial_player_costs() -> Dict[int, float]:
+    """
+    Fetches base GW1 purchase price for all players from FPL bootstrap-static:
+      start_cost = (now_cost - cost_change_start) / 10.0
+    Cached for 1 hour.
+    """
+    global _bootstrap_cost_cache, _bootstrap_cache_time
+    now = time.time()
+    if _bootstrap_cost_cache and (now - _bootstrap_cache_time) < 3600:
+        return _bootstrap_cost_cache
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            res = client.get(
+                "https://fantasy.premierleague.com/api/bootstrap-static/",
+                headers={"User-Agent": "FPL-Decision-Engine/1.0"}
+            )
+            if res.is_success:
+                data = res.json()
+                cache = {}
+                for el in data.get("elements", []):
+                    start_cost = (el["now_cost"] - el.get("cost_change_start", 0)) / 10.0
+                    cache[el["id"]] = start_cost
+                _bootstrap_cost_cache = cache
+                _bootstrap_cache_time = now
+                return cache
+    except Exception as e:
+        logger.warning(f"Failed to fetch bootstrap-static for player start costs: {e}")
+    return _bootstrap_cost_cache
+
+
+def get_squad_selling_prices(
+    team_id: int,
+    current_squad_ids: List[int],
+    pool_by_id: Dict[int, dict]
+) -> Dict[int, float]:
+    """
+    Computes exact FPL selling prices for the user's current squad:
+      FPL Selling Rule:
+        If now_cost > purchase_price:
+          selling_price = purchase_price + floor((now_cost - purchase_price) / 2)
+        Else:
+          selling_price = now_cost
+    """
+    selling_prices: Dict[int, float] = {}
+    initial_costs = get_initial_player_costs()
+    purchase_prices: Dict[int, float] = {}
+
+    if team_id:
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                res = client.get(
+                    f"https://fantasy.premierleague.com/api/entry/{team_id}/transfers/",
+                    headers={"User-Agent": "FPL-Decision-Engine/1.0"}
+                )
+                if res.is_success:
+                    transfers = res.json()
+                    for t in reversed(transfers):
+                        pid = t.get("element_in")
+                        cost = t.get("element_in_cost")
+                        if pid and cost is not None and pid not in purchase_prices:
+                            purchase_prices[pid] = cost / 10.0
+        except Exception as e:
+            logger.warning(f"Failed to fetch transfers history for team {team_id}: {e}")
+
+    for pid in current_squad_ids:
+        now_cost = pool_by_id[pid]["price"] if pid in pool_by_id else 0.0
+        if pid in purchase_prices:
+            buy_price = purchase_prices[pid]
+        elif pid in initial_costs:
+            buy_price = initial_costs[pid]
+        else:
+            buy_price = now_cost
+
+        profit_tenths = int(round((now_cost - buy_price) * 10))
+        if profit_tenths > 0:
+            sell_price = buy_price + (profit_tenths // 2) / 10.0
+        else:
+            sell_price = now_cost
+        selling_prices[pid] = round(sell_price, 1)
+
+    return selling_prices
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 3-Tier MILP Solver (Squad, Starting XI, Captain)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -185,12 +278,22 @@ def solve_chip_plan(
     current_ids = set(req.current_squad)
     pool_by_id = {p["player_id"]: p for p in player_pool}
 
-    current_squad_value = sum(
-        pool_by_id[pid]["price"]
+    selling_prices = req.selling_prices or {}
+
+    effective_costs = {}
+    for p in player_pool:
+        pid = p["player_id"]
+        if pid in current_ids:
+            effective_costs[pid] = selling_prices.get(pid, p["price"])
+        else:
+            effective_costs[pid] = p["price"]
+
+    current_squad_selling_value = sum(
+        selling_prices.get(pid, pool_by_id[pid]["price"])
         for pid in req.current_squad
         if pid in pool_by_id
     )
-    total_budget = current_squad_value + req.bank
+    total_budget = round(current_squad_selling_value + req.bank, 1)
 
     prob = pulp.LpProblem(f"FPL_Solve_{chip_mode}_gw{req.gameweek}_h{req.horizon}", pulp.LpMaximize)
 
@@ -222,8 +325,8 @@ def solve_chip_plan(
     prob += pulp.lpSum(x[p["player_id"]] for p in player_pool if p["position"] == "FWD") >= 1
     prob += pulp.lpSum(x[p["player_id"]] for p in player_pool if p["position"] == "FWD") <= 3
 
-    # Squad budget
-    prob += pulp.lpSum(p["price"] * s[p["player_id"]] for p in player_pool) <= total_budget
+    # Squad budget using effective costs (selling price for owned, now_cost for new)
+    prob += pulp.lpSum(effective_costs[p["player_id"]] * s[p["player_id"]] for p in player_pool) <= total_budget
 
     # Max 3 players per club
     teams_in_pool = {p["team"] for p in player_pool}
@@ -326,12 +429,15 @@ def solve_chip_plan(
         else:
             mult = 1 if chip_mode == "benchboost" else 0
 
+        pid = p_dict["player_id"]
+        display_price = effective_costs.get(pid, p_dict["price"])
+
         return PlayerRec(
-            player_id=p_dict["player_id"],
+            player_id=pid,
             web_name=p_dict["web_name"],
             team=p_dict["team"],
             position=p_dict["position"],
-            price=p_dict["price"],
+            price=display_price,
             projected_points=p_dict["projected_points"],
             is_captain=is_cap,
             is_vice_captain=is_vc,
@@ -366,9 +472,15 @@ def solve_chip_plan(
         pos_out = sorted([pool_by_id[pid] for pid in out_ids if pool_by_id[pid]["position"] == pos], key=lambda p: p["projected_points"])
         pos_in = sorted([pool_by_id[pid] for pid in in_ids if pool_by_id[pid]["position"] == pos], key=lambda p: p["projected_points"], reverse=True)
         for out_p, in_p in zip(pos_out, pos_in):
+            out_rec = to_player_rec(out_p, is_starter=True)
+            out_rec.price = selling_prices.get(out_p["player_id"], out_p["price"])
+
+            in_rec = to_player_rec(in_p, is_starter=True)
+            in_rec.price = in_p["price"]
+
             transfer_deltas.append(TransferDelta(
-                out=to_player_rec(out_p, is_starter=True),
-                in_=to_player_rec(in_p, is_starter=True),
+                out=out_rec,
+                in_=in_rec,
                 points_gain=round(in_p["projected_points"] - out_p["projected_points"], 2),
                 hit_cost=0,
             ))
@@ -405,6 +517,10 @@ def evaluate_all_chips(
     Evaluates all 5 chip strategies (Standard, Wildcard, Free Hit, Bench Boost, Triple Captain).
     Enforces strict FPL single-chip exclusivity: only ONE strategy is marked RECOMMENDED per gameweek.
     """
+    pool_by_id = {p["player_id"]: p for p in player_pool}
+    if req.selling_prices is None:
+        req.selling_prices = get_squad_selling_prices(req.team_id, req.current_squad, pool_by_id)
+
     chip_defs = [
         ("none", "Standard Play", "Use standard free transfers and at most 1 tactical hit for steady squad progression."),
         ("wildcard", "Wildcard", "Rebuild your entire 15-man squad with zero transfer point deductions."),

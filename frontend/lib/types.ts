@@ -52,6 +52,7 @@ export interface OptimizeRequest {
   wildcard_active?: boolean
   chip?: ChipType | string
   horizon?: number          // 1, 3, 5
+  selling_prices?: Record<number, number>
 }
 
 export interface OptimizeResponse {
