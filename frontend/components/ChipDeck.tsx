@@ -44,6 +44,9 @@ export default function ChipDeck({
       ? `GW${gameweek} (1 GW)`
       : `GW${gameweek} – GW${gameweek + horizon - 1} (${horizon} GWs)`
 
+  const isFirstHalf = gameweek <= 19
+  const remainingInHalf = isFirstHalf ? 19 - gameweek + 1 : 38 - gameweek + 1
+
   return (
     <div className="flex flex-col gap-3 border border-border-hard bg-surface-card p-4 rounded-md">
       {/* Deck Header & AI Callout */}
@@ -54,6 +57,19 @@ export default function ChipDeck({
           </span>
           <span className="font-mono text-[9px] bg-accent-cyan/10 text-accent-cyan border border-accent-cyan/30 px-1.5 py-0.5 rounded-sm">
             HORIZON: {horizonSpan}
+          </span>
+          <span
+            className={`font-mono text-[9px] px-1.5 py-0.5 rounded-sm border ${
+              isFirstHalf
+                ? remainingInHalf <= 5
+                  ? 'bg-accent-loss/15 text-accent-loss border-accent-loss/30 animate-pulse font-bold'
+                  : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                : 'bg-indigo-500/10 text-indigo-400 border-indigo-500/30'
+            }`}
+          >
+            {isFirstHalf
+              ? `SET 1 ACTIVE · ${remainingInHalf} GWs TO GW19 DEADLINE`
+              : `SET 2 ACTIVE · GW20–GW38`}
           </span>
         </div>
 

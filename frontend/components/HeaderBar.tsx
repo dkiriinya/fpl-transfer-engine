@@ -29,8 +29,11 @@ export default function HeaderBar({
   onChangeTeam,
   isLoading,
 }: HeaderBarProps) {
-  // Select a window of relevant gameweeks (e.g. GW3 to GW8)
-  const displayGws = [3, 4, 5, 6, 7, 8]
+  // Compute a rolling window of relevant gameweeks (6 GWs) centered around the selected/next gameweek
+  const nextGw = events.find((e) => e.is_next)?.id ?? events.find((e) => e.is_current)?.id ?? gameweek ?? 1
+  const centerGw = gameweek || nextGw
+  const startGw = Math.max(1, Math.min(33, centerGw - 2))
+  const displayGws = Array.from({ length: 6 }, (_, i) => startGw + i)
 
   return (
     <header className="flex flex-col border-b border-border-hard bg-surface-card">
@@ -91,9 +94,9 @@ export default function HeaderBar({
           </span>
           {displayGws.map((gwNum) => {
             const ev = events.find((e) => e.id === gwNum)
-            const isFinished = ev?.finished || gwNum < 4
+            const isFinished = !!ev?.finished
             const isTarget = gwNum === gameweek
-            const isUpcoming = ev?.is_next || gwNum === 4
+            const isUpcoming = !!ev?.is_next
 
             return (
               <button

@@ -422,20 +422,69 @@ def evaluate_all_chips(
     wc_gain = round(solved_plans["wildcard"]["net_points"] - standard_net, 2)
     fh_gain = round(solved_plans["freehit"]["net_points"] - standard_net, 2)
     bb_bench_pts = solved_plans["benchboost"]["bench_points"]
-    tc_cap_pts = solved_plans["triplecaptain"]["cap_points"]
+    # Two Sets of Chips rules:
+    # Set 1 runs GW1–GW19 (deadline GW19). Set 2 refreshes GW20–GW38.
+    # Chips do NOT carry over between halves.
+    gw = req.gameweek
+    is_first_half = gw <= 19
+    remaining_in_half = max(1, (19 - gw + 1) if is_first_half else (38 - gw + 1))
+    h_scale = max(1, req.horizon)
 
-    # In FPL, chips are only recommended if high strategic thresholds are met (scaled by horizon)
+    standard_net = solved_plans["none"]["net_points"]
+    wc_plan = solved_plans["wildcard"]
+    fh_plan = solved_plans["freehit"]
+    bb_plan = solved_plans["benchboost"]
+    tc_plan = solved_plans["triplecaptain"]
+
+    wc_gain = round(wc_plan["net_points"] - standard_net, 2)
+    fh_gain = round(fh_plan["net_points"] - standard_net, 2)
+    bb_bench_pts = bb_plan["bench_points"]
+    tc_cap_pts = tc_plan["cap_points"]
+
+    bench_per_gw = round(bb_bench_pts / h_scale, 2)
+    cap_per_gw = round(tc_cap_pts / h_scale, 2)
+    wc_transfers = wc_plan["transfers_made"]
+
     recommended_chip_id = "none"
-    h_scale = req.horizon
 
-    if bb_bench_pts >= (24.0 * h_scale):
-        recommended_chip_id = "benchboost"
-    elif tc_cap_pts >= (18.0 * h_scale):
-        recommended_chip_id = "triplecaptain"
-    elif wc_gain >= (20.0 * h_scale) and solved_plans["wildcard"]["transfers_made"] >= 6:
-        recommended_chip_id = "wildcard"
-    elif fh_gain >= (22.0 * h_scale):
-        recommended_chip_id = "freehit"
+    if is_first_half:
+        # In Set 1, all 4 chips MUST be used before the GW19 deadline.
+        # Prime windows:
+        # - Wildcard: GW6–GW8 or GW11–GW12 (and sets up Bench Boost)
+        # - Bench Boost: Follows Wildcard or whenever 4 bench players have solid fixtures (xP >= 11.5)
+        # - Triple Captain: Elite single-fixture captaincy (xP >= 7.8)
+        # - Free Hit: Congested December fixture swings (GW14–GW18) or heavy fixture clash weeks
+
+        # Priority 1: Wildcard (Sets up squad structure and subsequent Bench Boost)
+        is_prime_wc_window = gw in (6, 7, 8, 11, 12)
+        if (wc_gain >= 5.0 or (is_prime_wc_window and wc_gain >= 2.0 and wc_transfers >= 5)) and wc_transfers >= 5:
+            recommended_chip_id = "wildcard"
+        elif remaining_in_half <= 5 and wc_transfers >= 4:
+            # Deadline urgency: Do not forfeit Wildcard 1!
+            recommended_chip_id = "wildcard"
+
+        # Priority 2: Triple Captain (Elite single-fixture home run, e.g. Haaland/Salah at home)
+        elif cap_per_gw >= 8.0 or (remaining_in_half <= 4 and cap_per_gw >= 6.8):
+            recommended_chip_id = "triplecaptain"
+
+        # Priority 3: Bench Boost (High active bench projection)
+        elif bench_per_gw >= 11.5 or (remaining_in_half <= 4 and bench_per_gw >= 8.5):
+            recommended_chip_id = "benchboost"
+
+        # Priority 4: Free Hit (Congested winter rotation or heavy single-week spike)
+        elif fh_gain >= 9.0 or (gw >= 14 and fh_gain >= 6.5):
+            recommended_chip_id = "freehit"
+
+    else:
+        # Set 2 (GW20–GW38): Fresh set of 4 chips. Target Blank & Double Gameweeks.
+        if bb_bench_pts >= (18.0 * h_scale):
+            recommended_chip_id = "benchboost"
+        elif tc_cap_pts >= (14.0 * h_scale):
+            recommended_chip_id = "triplecaptain"
+        elif wc_gain >= (15.0 * h_scale) and wc_transfers >= 6:
+            recommended_chip_id = "wildcard"
+        elif fh_gain >= (14.0 * h_scale):
+            recommended_chip_id = "freehit"
 
     evaluations: List[ChipEvaluation] = []
     for chip_id, chip_name, description in chip_defs:
@@ -448,49 +497,93 @@ def evaluate_all_chips(
             reasoning = f"Optimal play: {plan['transfers_made']} strategic transfer(s) yielding {net:.1f} net points over {req.horizon} GW(s)."
 
         elif chip_id == "wildcard":
-            if recommended_chip_id == "wildcard":
-                verdict = "RECOMMENDED"
-                reasoning = f"Urgent squad overhaul: {plan['transfers_made']} transfers yield +{gain:.1f} pt swing with zero hit penalties."
-            elif gain >= (12.0 * h_scale) and plan["transfers_made"] >= 5:
-                verdict = "CONSIDER"
-                reasoning = f"Provides +{gain:.1f} pts across {plan['transfers_made']} transfers over {req.horizon} GW(s)."
+            if is_first_half:
+                if recommended_chip_id == "wildcard":
+                    verdict = "RECOMMENDED"
+                    reasoning = f"Set 1 Strategy (GW{gw}/19): Prime squad overhaul ({wc_transfers} moves, +{gain:.1f} pts). Construct a playing 15-man squad now to set up your Bench Boost in the next 1–2 weeks before the GW19 chip refresh."
+                elif gain >= 3.0 and wc_transfers >= 4:
+                    verdict = "CONSIDER"
+                    reasoning = f"Set 1 Option: +{gain:.1f} pts gain over {h_scale} GW(s). Strong overhaul candidate ({remaining_in_half} GWs remaining until GW19 deadline)."
+                else:
+                    verdict = "HOLD / SAVE"
+                    reasoning = f"Set 1 Plan: +{gain:.1f} pts gain. Best deployed in GW6–GW8 or GW11–GW12. Must be played before the GW19 deadline ({remaining_in_half} GWs left)."
             else:
-                verdict = "HOLD / SAVE"
-                reasoning = f"+{gain:.1f} pts gain is insufficient to spend your Wildcard. Preserve it for upcoming fixture swings."
+                if recommended_chip_id == "wildcard":
+                    verdict = "RECOMMENDED"
+                    reasoning = f"Set 2 Overhaul: {wc_transfers} transfers yield +{gain:.1f} pt swing with zero hit penalties. Optimal setup for upcoming Double Gameweeks."
+                elif gain >= (10.0 * h_scale) and wc_transfers >= 5:
+                    verdict = "CONSIDER"
+                    reasoning = f"Provides +{gain:.1f} pts across {wc_transfers} transfers over {h_scale} GW(s)."
+                else:
+                    verdict = "HOLD / SAVE"
+                    reasoning = f"+{gain:.1f} pts gain is insufficient. Preserve Wildcard 2 for late Double Gameweeks (GW30+)."
 
         elif chip_id == "freehit":
-            if recommended_chip_id == "freehit":
-                verdict = "RECOMMENDED"
-                reasoning = f"Exceptional single-gameweek spike (+{gain:.1f} pts). Ideal fixture targeting."
-            elif gain >= (14.0 * h_scale):
-                verdict = "CONSIDER"
-                reasoning = f"Provides a +{gain:.1f} pt projection boost. Better preserved for major Blank Gameweeks (BGWs)."
+            if is_first_half:
+                if recommended_chip_id == "freehit":
+                    verdict = "RECOMMENDED"
+                    reasoning = f"Set 1 Strike: Exceptional +{gain:.1f} pt spike. Ideal targeting for heavy fixture clashes or winter rotation."
+                elif gain >= 6.0 or (gw >= 14 and gain >= 4.0):
+                    verdict = "CONSIDER"
+                    reasoning = f"Set 1 Option: +{gain:.1f} pt projection boost. Best deployed in congested December fixtures (GW14–GW18). Note: Do NOT play in GW19 if planning a chip in GW20!"
+                else:
+                    verdict = "HOLD / SAVE"
+                    reasoning = f"Set 1 Plan: Save Free Hit for congested December rotation (GW14–GW18) before the GW19 deadline ({remaining_in_half} GWs left)."
             else:
-                verdict = "HOLD / SAVE"
-                reasoning = f"Save Free Hit for major Blank Gameweeks when several key teams blank."
+                if recommended_chip_id == "freehit":
+                    verdict = "RECOMMENDED"
+                    reasoning = f"Exceptional single-gameweek spike (+{gain:.1f} pts). Ideal fixture targeting for Blank/Double Gameweek."
+                elif gain >= (10.0 * h_scale):
+                    verdict = "CONSIDER"
+                    reasoning = f"Provides a +{gain:.1f} pt projection boost. Better preserved for major Blank Gameweeks (BGWs)."
+                else:
+                    verdict = "HOLD / SAVE"
+                    reasoning = f"Save Free Hit 2 for major spring Blank Gameweeks (GW29/GW34)."
 
         elif chip_id == "benchboost":
-            if recommended_chip_id == "benchboost":
-                verdict = "RECOMMENDED"
-                reasoning = f"Elite bench projection of {bb_bench_pts:.1f} points over {req.horizon} GW(s). Optimal timing for Bench Boost."
-            elif bb_bench_pts >= (16.0 * h_scale):
-                verdict = "CONSIDER"
-                reasoning = f"Bench contributes {bb_bench_pts:.1f} points. Strong, but maximum value is achieved during a Double Gameweek."
+            if is_first_half:
+                if recommended_chip_id == "benchboost":
+                    verdict = "RECOMMENDED"
+                    reasoning = f"Set 1 Opportunity: Bench projects {bb_bench_pts:.1f} pts (~{bench_per_gw:.1f}/GW). Deploy before injuries/rotations strike to bank your first Bench Boost before the GW19 refresh."
+                elif bench_per_gw >= 9.5:
+                    verdict = "CONSIDER"
+                    reasoning = f"Set 1 Viable: Bench contributes {bb_bench_pts:.1f} points (~{bench_per_gw:.1f}/GW). Best deployed immediately after your Wildcard ({remaining_in_half} GWs left before GW19 deadline)."
+                else:
+                    verdict = "HOLD / SAVE"
+                    reasoning = f"Set 1 Plan: Bench projects {bb_bench_pts:.1f} pts. Pair Bench Boost 1–2 gameweeks after your Wildcard for maximum 15-man starting power before GW19."
             else:
-                verdict = "HOLD / SAVE"
-                reasoning = f"Bench projection is {bb_bench_pts:.1f} pts. Save Bench Boost for a confirmed Double Gameweek (DGW)."
+                if recommended_chip_id == "benchboost":
+                    verdict = "RECOMMENDED"
+                    reasoning = f"Elite bench projection of {bb_bench_pts:.1f} points over {h_scale} GW(s). Optimal timing for Bench Boost 2 during a Double Gameweek."
+                elif bb_bench_pts >= (14.0 * h_scale):
+                    verdict = "CONSIDER"
+                    reasoning = f"Bench contributes {bb_bench_pts:.1f} points. Strong, but maximum value is achieved during a Double Gameweek."
+                else:
+                    verdict = "HOLD / SAVE"
+                    reasoning = f"Bench projection is {bb_bench_pts:.1f} pts. Save Bench Boost 2 for confirmed spring Double Gameweeks (DGWs)."
 
         elif chip_id == "triplecaptain":
             cap_name = plan["captain"].web_name if plan["captain"] else "Captain"
-            if recommended_chip_id == "triplecaptain":
-                verdict = "RECOMMENDED"
-                reasoning = f"Elite captain {cap_name} with {tc_cap_pts:.1f} pts projection (+{tc_cap_pts:.1f} extra points). Prime TC window."
-            elif tc_cap_pts >= (14.0 * h_scale):
-                verdict = "CONSIDER"
-                reasoning = f"{cap_name} is projected for {tc_cap_pts:.1f} pts (+{tc_cap_pts:.1f} boost). Viable, but Double Gameweeks offer higher ceilings."
+            if is_first_half:
+                if recommended_chip_id == "triplecaptain":
+                    verdict = "RECOMMENDED"
+                    reasoning = f"Set 1 Home Run: {cap_name} projects {tc_cap_pts:.1f} pts (~{cap_per_gw:.1f}/GW). Elite fixture match to bank your first Triple Captain before the GW19 refresh."
+                elif cap_per_gw >= 6.8:
+                    verdict = "CONSIDER"
+                    reasoning = f"Set 1 Candidate: {cap_name} is projected for {tc_cap_pts:.1f} pts (~{cap_per_gw:.1f}/GW). Viable single-fixture window ({remaining_in_half} GWs remaining until GW19 deadline)."
+                else:
+                    verdict = "HOLD / SAVE"
+                    reasoning = f"Set 1 Plan: {cap_name} projection is {tc_cap_pts:.1f} pts. Target an elite home match (e.g. Haaland/Salah vs promoted side) before the GW19 deadline."
             else:
-                verdict = "HOLD / SAVE"
-                reasoning = f"Captain ceiling is {tc_cap_pts:.1f} pts over {req.horizon} GW(s). Save Triple Captain for a Double Gameweek (DGW)."
+                if recommended_chip_id == "triplecaptain":
+                    verdict = "RECOMMENDED"
+                    reasoning = f"Elite captain {cap_name} with {tc_cap_pts:.1f} pts projection (+{tc_cap_pts:.1f} extra points). Prime Double Gameweek TC window."
+                elif tc_cap_pts >= (12.0 * h_scale):
+                    verdict = "CONSIDER"
+                    reasoning = f"{cap_name} is projected for {tc_cap_pts:.1f} pts. Viable, but Double Gameweeks offer higher ceilings."
+                else:
+                    verdict = "HOLD / SAVE"
+                    reasoning = f"Captain ceiling is {tc_cap_pts:.1f} pts over {h_scale} GW(s). Save Triple Captain 2 for a Double Gameweek (DGW)."
         else:
             verdict = "HOLD / SAVE"
             reasoning = "Chip evaluated."
