@@ -6,7 +6,7 @@ export async function GET() {
   try {
     const res = await fetch(FPL_BOOTSTRAP_URL, {
       headers: { 'User-Agent': 'FPL-Decision-Engine/1.0' },
-      next: { revalidate: 300 },
+      cache: 'no-store',
     })
 
     if (!res.ok) {
@@ -27,15 +27,15 @@ export async function GET() {
 
     const current = events.find((e) => e.is_current)
     const next = events.find((e) => e.is_next)
-    
-    // If current is already finished or next is defined, upcoming gameweek to plan for is next.id
-    let upcomingGameweek = 4
+
+    // Once a gameweek is current (in progress or finished), its transfer deadline has passed.
+    // The actionable gameweek for transfers/chips is always `next.id` (or current.id + 1).
+    const liveGameweek = current ? current.id : null
+    let planningGameweek = 7
     if (next) {
-      upcomingGameweek = next.id
-    } else if (current && !current.finished) {
-      upcomingGameweek = current.id
+      planningGameweek = next.id
     } else if (current) {
-      upcomingGameweek = current.id + 1
+      planningGameweek = Math.min(38, current.id + 1)
     }
 
     const playerPhotos: Record<number, string> = {}
@@ -51,7 +51,9 @@ export async function GET() {
     }
 
     return NextResponse.json({
-      currentGameweek: upcomingGameweek,
+      currentGameweek: planningGameweek,
+      liveGameweek,
+      planningGameweek,
       events: events.map((e) => ({
         id: e.id,
         name: e.name,

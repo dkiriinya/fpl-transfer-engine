@@ -27,10 +27,11 @@ services:
       dockerfile: Dockerfile
     container_name: fpl-frontend
     ports:
-      - "3000:3000"
+      - "3800:3800"
     env_file:
       - .env
     environment:
+      - PORT=3800
       - BACKEND_URL=http://backend:8000
     depends_on:
       backend:

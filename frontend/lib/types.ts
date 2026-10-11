@@ -48,7 +48,7 @@ export interface OptimizeRequest {
   gameweek: number
   current_squad: number[]   // 15 FPL player element IDs
   bank: number              // budget in millions
-  free_transfers: number    // 1 or 2
+  free_transfers: number    // 1 to 5
   wildcard_active?: boolean
   chip?: ChipType | string
   horizon?: number          // 1, 3, 5
@@ -81,8 +81,21 @@ export interface FPLPick {
   is_vice_captain: boolean
 }
 
+export interface ActualLineupSnapshot {
+  starting_xi: PlayerRec[]
+  bench: PlayerRec[]
+  captain: PlayerRec | null
+  vice_captain: PlayerRec | null
+  total_points: number
+  bench_points: number
+}
+
 export interface FPLSquadResponse {
   picks: FPLPick[]
+  active_chip?: string | null
+  is_exact_gw?: boolean
+  free_transfers?: number
+  actual_lineup?: ActualLineupSnapshot
   entry_history: {
     bank: number           // raw value — divide by 10 for millions
     event_transfers: number
@@ -94,6 +107,8 @@ export interface FPLSquadResponse {
 
 export interface BootstrapResponse {
   currentGameweek: number
+  liveGameweek?: number | null
+  planningGameweek?: number
   events?: Array<{
     id: number
     name: string

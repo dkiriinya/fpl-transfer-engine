@@ -11,6 +11,7 @@ interface SquadPitchProps {
   gameweek: number
   horizon: number
   playerPhotos?: Record<number, string>
+  headerTag?: string
 }
 
 export default function SquadPitch({
@@ -21,6 +22,7 @@ export default function SquadPitch({
   gameweek,
   horizon,
   playerPhotos = {},
+  headerTag,
 }: SquadPitchProps) {
   const gkps = startingXi.filter((p) => p.position === 'GKP')
   const defs = startingXi.filter((p) => p.position === 'DEF')
@@ -31,9 +33,10 @@ export default function SquadPitch({
   const benchLabels = ['GK SUB', 'SUB 1', 'SUB 2', 'SUB 3']
 
   const horizonSpan =
-    horizon === 1
+    headerTag ??
+    (horizon === 1
       ? `GW${gameweek} PROJECTIONS (1 GW)`
-      : `GW${gameweek}–GW${gameweek + horizon - 1} PROJECTIONS (${horizon} GWs)`
+      : `GW${gameweek}–GW${gameweek + horizon - 1} PROJECTIONS (${horizon} GWs)`)
 
   return (
     <div className="flex flex-col gap-3">

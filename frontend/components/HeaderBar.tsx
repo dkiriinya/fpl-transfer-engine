@@ -5,6 +5,7 @@ interface HeaderBarProps {
   gameweek: number
   horizon: number
   bankBalance: number
+  isLockedGw?: boolean
   events?: Array<{
     id: number
     name: string
@@ -23,14 +24,18 @@ export default function HeaderBar({
   gameweek,
   horizon,
   bankBalance,
+  isLockedGw = false,
   events = [],
   onSelectGameweek,
   onSelectHorizon,
   onChangeTeam,
   isLoading,
 }: HeaderBarProps) {
-  // Compute a rolling window of relevant gameweeks (6 GWs) centered around the selected/next gameweek
-  const nextGw = events.find((e) => e.is_next)?.id ?? events.find((e) => e.is_current)?.id ?? gameweek ?? 1
+  const liveEvent = events.find((e) => e.is_current)
+  const nextEvent = events.find((e) => e.is_next)
+  const liveGw = liveEvent?.id ?? null
+  const nextGw = nextEvent?.id ?? (liveGw ? Math.min(38, liveGw + 1) : gameweek)
+
   const centerGw = gameweek || nextGw
   const startGw = Math.max(1, Math.min(33, centerGw - 2))
   const displayGws = Array.from({ length: 6 }, (_, i) => startGw + i)
@@ -64,6 +69,40 @@ export default function HeaderBar({
                 £{bankBalance.toFixed(1)}m
               </span>
             </div>
+
+            {liveGw && (
+              <>
+                <div className="w-px h-5 bg-border-hard" />
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => onSelectGameweek(liveGw)}
+                    className={`flex items-center gap-1.5 px-2.5 py-1 rounded-sm font-mono text-[10px] border transition-colors ${
+                      gameweek === liveGw
+                        ? 'bg-amber-500/20 text-amber-300 border-amber-400 font-bold'
+                        : 'bg-surface-elevated text-amber-300/90 border-amber-500/30 hover:border-amber-400'
+                    }`}
+                    title={`GW${liveGw} is currently in progress (deadline passed). Click to view your locked GW${liveGw} squad.`}
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                    <span>GW{liveGw} {liveEvent?.finished ? 'FINISHED' : 'LIVE NOW'}</span>
+                  </button>
+
+                  {nextGw && nextGw !== liveGw && (
+                    <button
+                      onClick={() => onSelectGameweek(nextGw)}
+                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-sm font-mono text-[10px] border transition-colors ${
+                        gameweek === nextGw
+                          ? 'bg-accent-gain/20 text-accent-gain border-accent-gain font-bold'
+                          : 'bg-surface-elevated text-accent-gain/90 border-accent-gain/30 hover:border-accent-gain'
+                      }`}
+                      title={`Jump to GW${nextGw} to plan upcoming transfers and chips`}
+                    >
+                      <span>PLAN NEXT: GW{nextGw} →</span>
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -72,7 +111,7 @@ export default function HeaderBar({
           {isLoading && (
             <span className="font-mono text-[10px] text-accent-cyan uppercase tracking-widest animate-pulse flex items-center gap-1">
               <span className="w-2 h-2 rounded-full bg-accent-cyan animate-ping inline-block" />
-              SOLVING GW{gameweek} ({horizon} GW{horizon > 1 ? 's' : ''})…
+              LOADING GW{gameweek}…
             </span>
           )}
           <button
@@ -95,8 +134,9 @@ export default function HeaderBar({
           {displayGws.map((gwNum) => {
             const ev = events.find((e) => e.id === gwNum)
             const isFinished = !!ev?.finished
+            const isLive = !!ev?.is_current && !ev?.finished
             const isTarget = gwNum === gameweek
-            const isUpcoming = !!ev?.is_next
+            const isNext = !!ev?.is_next
 
             return (
               <button
@@ -105,6 +145,8 @@ export default function HeaderBar({
                 className={`flex items-center gap-1 px-2.5 py-1 rounded-sm text-xs font-mono transition-all border ${
                   isTarget
                     ? 'bg-accent-cyan/15 text-accent-cyan border-accent-cyan font-bold shadow-sm'
+                    : isLive
+                    ? 'bg-amber-500/10 text-amber-300 border-amber-500/40 hover:border-amber-400'
                     : isFinished
                     ? 'bg-surface-canvas text-text-muted border-border-hard hover:border-slate-600'
                     : 'bg-surface-card text-text-secondary border-border-hard hover:border-accent-cyan/50 hover:text-text-primary'
@@ -114,43 +156,59 @@ export default function HeaderBar({
                 {isFinished && (
                   <span className="text-[8px] bg-slate-800 text-text-muted px-1 rounded">Past</span>
                 )}
-                {isUpcoming && !isTarget && (
-                  <span className="text-[8px] bg-accent-gain/20 text-accent-gain px-1 rounded">Active</span>
+                {isLive && (
+                  <span className="text-[8px] bg-amber-500/20 text-amber-300 px-1 rounded font-bold">Live</span>
                 )}
-                {isTarget && (
-                  <span className="text-[8px] bg-accent-cyan/20 text-accent-cyan px-1 rounded font-bold">Selected</span>
+                {isNext && (
+                  <span className="text-[8px] bg-accent-gain/20 text-accent-gain px-1 rounded font-bold">Next</span>
                 )}
               </button>
             )
           })}
         </div>
 
-        {/* Multi-Gameweek Horizon Selector */}
-        <div className="flex items-center gap-1.5">
-          <span className="font-mono text-[9px] uppercase tracking-widest text-text-secondary mr-1">
-            PLANNING HORIZON:
-          </span>
-          {[
-            { h: 1, label: '1 GW' },
-            { h: 3, label: '3 GWs' },
-            { h: 5, label: '5 GWs' },
-          ].map(({ h, label }) => {
-            const isActive = horizon === h
-            return (
+        {/* Multi-Gameweek Horizon Selector (shown only for editable future gameweeks) */}
+        {isLockedGw ? (
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[10px] text-amber-300 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-sm">
+              🔒 DEADLINE PASSED · SHOWING ACTUAL GW{gameweek} SQUAD (NO TRANSFERS/SUBS)
+            </span>
+            {nextGw && (
               <button
-                key={h}
-                onClick={() => onSelectHorizon(h)}
-                className={`px-2.5 py-1 rounded-sm font-mono text-xs transition-all border ${
-                  isActive
-                    ? 'bg-accent-gain/20 text-accent-gain border-accent-gain font-bold shadow-sm'
-                    : 'bg-surface-card text-text-secondary border-border-hard hover:border-accent-gain/50 hover:text-text-primary'
-                }`}
+                onClick={() => onSelectGameweek(nextGw)}
+                className="font-mono text-[10px] font-bold text-accent-gain bg-accent-gain/15 border border-accent-gain/40 px-2.5 py-1 rounded-sm hover:bg-accent-gain/25 transition-colors"
               >
-                {label}
+                PLAN GW{nextGw} TRANSFERS →
               </button>
-            )
-          })}
-        </div>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5">
+            <span className="font-mono text-[9px] uppercase tracking-widest text-text-secondary mr-1">
+              PLANNING HORIZON:
+            </span>
+            {[
+              { h: 1, label: '1 GW' },
+              { h: 3, label: '3 GWs' },
+              { h: 5, label: '5 GWs' },
+            ].map(({ h, label }) => {
+              const isActive = horizon === h
+              return (
+                <button
+                  key={h}
+                  onClick={() => onSelectHorizon(h)}
+                  className={`px-2.5 py-1 rounded-sm font-mono text-xs transition-all border ${
+                    isActive
+                      ? 'bg-accent-gain/20 text-accent-gain border-accent-gain font-bold shadow-sm'
+                      : 'bg-surface-card text-text-secondary border-border-hard hover:border-accent-gain/50 hover:text-text-primary'
+                  }`}
+                >
+                  {label}
+                </button>
+              )
+            })}
+          </div>
+        )}
       </div>
     </header>
   )

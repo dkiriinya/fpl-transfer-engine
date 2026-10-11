@@ -46,35 +46,51 @@ export default function Home() {
       setIsLoading(true)
       setError(null)
       try {
-        // Step 1: Bootstrap current/upcoming gameweek and player photos dictionary
+        // Step 1: Bootstrap live/planning gameweek and player photos dictionary
         const bootstrap = await fetchBootstrap()
-        const resolvedGw = targetGw ?? bootstrap.currentGameweek ?? 4
+        const bootEvents = bootstrap.events || []
+        const planningGw = bootstrap.planningGameweek ?? bootstrap.currentGameweek ?? 7
+        const resolvedGw = targetGw ?? planningGw
+
         setGameweek(resolvedGw)
         setHorizon(targetHorizon)
-        setEvents(bootstrap.events || [])
+        setEvents(bootEvents)
         setPlayerPhotos(bootstrap.playerPhotos || {})
 
-        // Step 2: Fetch live squad from FPL API
+        // Step 2: Fetch squad from FPL API
         const squadData = await fetchSquad(tid, resolvedGw)
         setSquad(squadData)
 
-        // Step 3: Run MILP solver with multi-gameweek horizon
-        const currentSquadIds = squadData.picks.map((p) => p.element)
-        const bank = squadData.entry_history.bank / 10
-        const eventTransfers = squadData.entry_history.event_transfers ?? 0
-        const freeTransfers = Math.max(1, 2 - eventTransfers)
+        // Check if target gameweek is already finished or currently live (deadline passed)
+        const gwEvent = bootEvents.find((e) => e.id === resolvedGw)
+        const isLockedGw = !!(gwEvent?.finished || gwEvent?.is_current || squadData.is_exact_gw)
 
-        const optimizeResult = await runOptimize({
-          team_id: tid,
-          gameweek: resolvedGw,
-          current_squad: currentSquadIds,
-          bank,
-          free_transfers: freeTransfers,
-          wildcard_active: false,
-          chip: 'none',
-          horizon: targetHorizon,
-        })
-        setResult(optimizeResult)
+        if (isLockedGw && squadData.actual_lineup) {
+          // Past or currently active gameweek: display actual squad snapshot without solver suggestions
+          setResult(null)
+        } else {
+          // Upcoming gameweek: run MILP solver for transfer and chip planning
+          const currentSquadIds = squadData.picks.map((p) => p.element)
+          const bank = squadData.entry_history.bank / 10
+          const eventTransfers = squadData.entry_history.event_transfers ?? 0
+          const isPrevUnlimitedChip =
+            squadData.active_chip === 'wildcard' || squadData.active_chip === 'freehit'
+          const freeTransfers =
+            squadData.free_transfers ??
+            (isPrevUnlimitedChip ? 1 : Math.max(1, 2 - eventTransfers))
+
+          const optimizeResult = await runOptimize({
+            team_id: tid,
+            gameweek: resolvedGw,
+            current_squad: currentSquadIds,
+            bank,
+            free_transfers: freeTransfers,
+            wildcard_active: false,
+            chip: 'none',
+            horizon: targetHorizon,
+          })
+          setResult(optimizeResult)
+        }
       } catch (err) {
         console.error('Pipeline error:', err)
         setError(err instanceof Error ? err.message : 'An unknown error occurred')
@@ -148,7 +164,7 @@ export default function Home() {
     )
   }
 
-  if (isLoading || !result || !squad || !gameweek) {
+  if (isLoading || !squad || !gameweek) {
     return <LoadingState />
   }
 

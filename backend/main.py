@@ -129,7 +129,7 @@ def fetch_player_pool(start_gw: int, horizon: int = 1) -> List[dict]:
             COALESCE(
                 SUM(
                     CASE 
-                        WHEN p.status IN ('u', 'i') THEN 0.0
+                        WHEN p.status IN ('u', 'i', 's', 'n') THEN 0.0
                         ELSE pp.expected_points 
                     END
                 ),
@@ -138,7 +138,9 @@ def fetch_player_pool(start_gw: int, horizon: int = 1) -> List[dict]:
         FROM players p
         JOIN teams t ON p.team_id = t.id
         LEFT JOIN player_projections pp
-            ON pp.player_id = p.id AND pp.gameweek BETWEEN %s AND %s
+            ON pp.player_id = p.id
+            AND pp.gameweek BETWEEN %s AND %s
+            AND pp.source = 'openfpl_ai'
         WHERE p.now_cost > 0
         GROUP BY p.id, p.web_name, p.position, p.now_cost, t.short_name
         ORDER BY projected_points DESC
@@ -266,6 +268,7 @@ def solve_chip_plan(
     req: OptimizeRequest,
     player_pool: List[dict],
     chip_mode: str,
+    long_term_pool: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """
     Solves optimal squad, starting XI, and captaincy using a 3-tier MILP model:
@@ -273,10 +276,12 @@ def solve_chip_plan(
       x[i] ∈ {0, 1}: 11 players in Starting XI (x[i] <= s[i])
       c[i] ∈ {0, 1}: 1 Captain (c[i] <= x[i])
     Objective:
-      Maximize Starting XI xP + Captain xP + 0.05 * Bench xP - Hit Penalty.
+      Maximize Starting XI xP + Captain xP + 0.05 * Bench xP + Retention Tiebreaker - Hit Penalty.
+      For Wildcard, also blends 4-GW multi-week lookahead so 15-man rebuilds never chase 1-GW mirages.
     """
     current_ids = set(req.current_squad)
     pool_by_id = {p["player_id"]: p for p in player_pool}
+    lt_by_id = {p["player_id"]: p["projected_points"] for p in long_term_pool} if long_term_pool else {}
 
     selling_prices = req.selling_prices or {}
 
@@ -348,12 +353,21 @@ def solve_chip_plan(
         h = 0
         hit_cost = 0
 
+    # Squad continuity tiebreaker to prevent unnecessary lateral churn of active owned returners
+    h_scale = max(1, req.horizon)
+    retention_bonus = pulp.lpSum(
+        (0.20 * h_scale) * s[p["player_id"]]
+        for p in player_pool
+        if p["player_id"] in current_ids and p["projected_points"] >= (3.8 * h_scale)
+    )
+
     # Objective Function
     if chip_mode == "benchboost":
         # All 15 players score + captain bonus
         prob += (
             pulp.lpSum(p["projected_points"] * s[p["player_id"]] for p in player_pool)
             + pulp.lpSum(p["projected_points"] * c[p["player_id"]] for p in player_pool)
+            + retention_bonus
             - hit_cost
         )
     elif chip_mode == "triplecaptain":
@@ -362,14 +376,27 @@ def solve_chip_plan(
             pulp.lpSum(p["projected_points"] * x[p["player_id"]] for p in player_pool)
             + 2 * pulp.lpSum(p["projected_points"] * c[p["player_id"]] for p in player_pool)
             + 0.05 * pulp.lpSum(p["projected_points"] * (s[p["player_id"]] - x[p["player_id"]]) for p in player_pool)
+            + retention_bonus
+            - hit_cost
+        )
+    elif chip_mode == "wildcard" and lt_by_id:
+        # Wildcard is a permanent multi-GW overhaul: blend active horizon with 4-GW lookahead
+        lt_scale = h_scale / 4.0
+        prob += (
+            0.50 * pulp.lpSum(p["projected_points"] * x[p["player_id"]] for p in player_pool)
+            + 0.50 * pulp.lpSum((lt_by_id.get(p["player_id"], p["projected_points"]) * lt_scale) * x[p["player_id"]] for p in player_pool)
+            + pulp.lpSum(p["projected_points"] * c[p["player_id"]] for p in player_pool)
+            + 0.12 * pulp.lpSum((lt_by_id.get(p["player_id"], p["projected_points"]) * lt_scale) * (s[p["player_id"]] - x[p["player_id"]]) for p in player_pool)
+            + retention_bonus
             - hit_cost
         )
     else:
-        # Standard, Wildcard, Free Hit
+        # Standard, Free Hit, or Wildcard when already on 4+ GW horizon
         prob += (
             pulp.lpSum(p["projected_points"] * x[p["player_id"]] for p in player_pool)
             + pulp.lpSum(p["projected_points"] * c[p["player_id"]] for p in player_pool)
             + 0.05 * pulp.lpSum(p["projected_points"] * (s[p["player_id"]] - x[p["player_id"]]) for p in player_pool)
+            + (0 if chip_mode == "freehit" else retention_bonus)
             - hit_cost
         )
 
@@ -509,17 +536,71 @@ def solve_chip_plan(
     }
 
 
+FPL_CHIP_NAME_MAP = {
+    "wildcard": "wildcard",
+    "freehit": "freehit",
+    "bboost": "benchboost",
+    "3xc": "triplecaptain",
+}
+
+
+def get_used_chips_in_half(team_id: int, target_gw: int) -> Dict[str, int]:
+    """
+    Fetches chip usage history from FPL API (/api/entry/{team_id}/history/).
+    FPL Two-Set Chip Rules:
+      - Set 1: GW1–GW19 (resets at GW20)
+      - Set 2: GW20–GW38
+    Returns {chip_id: event_gw_used} for chips already consumed in the target half.
+    """
+    used: Dict[str, int] = {}
+    if not team_id:
+        return used
+
+    is_first_half = target_gw <= 19
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            res = client.get(
+                f"https://fantasy.premierleague.com/api/entry/{team_id}/history/",
+                headers={"User-Agent": "FPL-Decision-Engine/1.0"},
+            )
+            if res.is_success:
+                data = res.json()
+                for c in data.get("chips", []):
+                    raw_name = c.get("name", "")
+                    chip_id = FPL_CHIP_NAME_MAP.get(raw_name, raw_name)
+                    ev = int(c.get("event") or 0)
+                    if ev <= 0:
+                        continue
+                    if is_first_half and 1 <= ev <= 19 and ev <= target_gw:
+                        used[chip_id] = ev
+                    elif (not is_first_half) and 20 <= ev <= 38 and ev <= target_gw:
+                        used[chip_id] = ev
+    except Exception as e:
+        logger.warning(f"Failed to fetch chip history for team {team_id}: {e}")
+
+    return used
+
+
 def evaluate_all_chips(
     req: OptimizeRequest,
     player_pool: List[dict],
 ) -> Tuple[Dict[str, Any], List[ChipEvaluation]]:
     """
     Evaluates all 5 chip strategies (Standard, Wildcard, Free Hit, Bench Boost, Triple Captain).
-    Enforces strict FPL single-chip exclusivity: only ONE strategy is marked RECOMMENDED per gameweek.
+    Enforces strict FPL single-chip exclusivity and locks chips already used in the active half-season.
     """
     pool_by_id = {p["player_id"]: p for p in player_pool}
     if req.selling_prices is None:
         req.selling_prices = get_squad_selling_prices(req.team_id, req.current_squad, pool_by_id)
+
+    used_chips = get_used_chips_in_half(req.team_id, req.gameweek)
+
+    long_term_pool: Optional[List[dict]] = None
+    if req.horizon < 4:
+        try:
+            long_term_pool = fetch_player_pool(req.gameweek, 4)
+        except Exception as e:
+            logger.warning(f"Could not fetch 4-GW pool for Wildcard lookahead: {e}")
 
     chip_defs = [
         ("none", "Standard Play", "Use standard free transfers and at most 1 tactical hit for steady squad progression."),
@@ -531,13 +612,13 @@ def evaluate_all_chips(
 
     solved_plans: Dict[str, Dict[str, Any]] = {}
     for chip_id, _, _ in chip_defs:
-        solved_plans[chip_id] = solve_chip_plan(req, player_pool, chip_id)
+        solved_plans[chip_id] = solve_chip_plan(
+            req,
+            player_pool,
+            chip_id,
+            long_term_pool=(long_term_pool if chip_id == "wildcard" else None),
+        )
 
-    standard_net = solved_plans["none"]["net_points"]
-
-    wc_gain = round(solved_plans["wildcard"]["net_points"] - standard_net, 2)
-    fh_gain = round(solved_plans["freehit"]["net_points"] - standard_net, 2)
-    bb_bench_pts = solved_plans["benchboost"]["bench_points"]
     # Two Sets of Chips rules:
     # Set 1 runs GW1–GW19 (deadline GW19). Set 2 refreshes GW20–GW38.
     # Chips do NOT carry over between halves.
@@ -564,42 +645,31 @@ def evaluate_all_chips(
     recommended_chip_id = "none"
 
     if is_first_half:
-        # In Set 1, all 4 chips MUST be used before the GW19 deadline.
-        # Prime windows:
-        # - Wildcard: GW6–GW8 or GW11–GW12 (and sets up Bench Boost)
-        # - Bench Boost: Follows Wildcard or whenever 4 bench players have solid fixtures (xP >= 11.5)
-        # - Triple Captain: Elite single-fixture captaincy (xP >= 7.8)
-        # - Free Hit: Congested December fixture swings (GW14–GW18) or heavy fixture clash weeks
-
-        # Priority 1: Wildcard (Sets up squad structure and subsequent Bench Boost)
+        # Only recommend chips that have NOT already been used in Set 1 (GW1–GW19)
         is_prime_wc_window = gw in (6, 7, 8, 11, 12)
-        if (wc_gain >= 5.0 or (is_prime_wc_window and wc_gain >= 2.0 and wc_transfers >= 5)) and wc_transfers >= 5:
+        if (
+            "wildcard" not in used_chips
+            and ((wc_gain >= 5.0 or (is_prime_wc_window and wc_gain >= 2.0 and wc_transfers >= 5)) and wc_transfers >= 5)
+        ):
             recommended_chip_id = "wildcard"
-        elif remaining_in_half <= 5 and wc_transfers >= 4:
-            # Deadline urgency: Do not forfeit Wildcard 1!
+        elif "wildcard" not in used_chips and remaining_in_half <= 5 and wc_transfers >= 4:
             recommended_chip_id = "wildcard"
-
-        # Priority 2: Triple Captain (Elite single-fixture home run, e.g. Haaland/Salah at home)
-        elif cap_per_gw >= 8.0 or (remaining_in_half <= 4 and cap_per_gw >= 6.8):
+        elif "triplecaptain" not in used_chips and (cap_per_gw >= 8.0 or (remaining_in_half <= 4 and cap_per_gw >= 6.8)):
             recommended_chip_id = "triplecaptain"
-
-        # Priority 3: Bench Boost (High active bench projection)
-        elif bench_per_gw >= 11.5 or (remaining_in_half <= 4 and bench_per_gw >= 8.5):
+        elif "benchboost" not in used_chips and (bench_per_gw >= 11.5 or (remaining_in_half <= 4 and bench_per_gw >= 8.5)):
             recommended_chip_id = "benchboost"
-
-        # Priority 4: Free Hit (Congested winter rotation or heavy single-week spike)
-        elif fh_gain >= 9.0 or (gw >= 14 and fh_gain >= 6.5):
+        elif "freehit" not in used_chips and (fh_gain >= 9.0 or (gw >= 14 and fh_gain >= 6.5)):
             recommended_chip_id = "freehit"
 
     else:
         # Set 2 (GW20–GW38): Fresh set of 4 chips. Target Blank & Double Gameweeks.
-        if bb_bench_pts >= (18.0 * h_scale):
+        if "benchboost" not in used_chips and bb_bench_pts >= (18.0 * h_scale):
             recommended_chip_id = "benchboost"
-        elif tc_cap_pts >= (14.0 * h_scale):
+        elif "triplecaptain" not in used_chips and tc_cap_pts >= (14.0 * h_scale):
             recommended_chip_id = "triplecaptain"
-        elif wc_gain >= (15.0 * h_scale) and wc_transfers >= 6:
+        elif "wildcard" not in used_chips and wc_gain >= (15.0 * h_scale) and wc_transfers >= 6:
             recommended_chip_id = "wildcard"
-        elif fh_gain >= (14.0 * h_scale):
+        elif "freehit" not in used_chips and fh_gain >= (14.0 * h_scale):
             recommended_chip_id = "freehit"
 
     evaluations: List[ChipEvaluation] = []
@@ -608,7 +678,18 @@ def evaluate_all_chips(
         net = plan["net_points"]
         gain = round(net - standard_net, 2)
 
-        if chip_id == "none":
+        if chip_id in used_chips:
+            used_gw = used_chips[chip_id]
+            verdict = f"USED (GW{used_gw})"
+            if is_first_half:
+                reasoning = (
+                    f"Already used in GW{used_gw}. Unavailable for the rest of Set 1 — "
+                    f"chips reset after GW19 (available again from GW20)."
+                )
+            else:
+                reasoning = f"Already used in GW{used_gw}. Set 2 {chip_name} is exhausted for the season."
+
+        elif chip_id == "none":
             verdict = "RECOMMENDED" if recommended_chip_id == "none" else "STANDARD"
             reasoning = f"Optimal play: {plan['transfers_made']} strategic transfer(s) yielding {net:.1f} net points over {req.horizon} GW(s)."
 
@@ -724,7 +805,7 @@ def evaluate_all_chips(
             bank_remaining=plan["bank_remaining"],
         ))
 
-    target_chip = req.chip if req.chip in solved_plans else "none"
+    target_chip = req.chip if (req.chip in solved_plans and req.chip not in used_chips) else "none"
     chosen_plan = solved_plans[target_chip]
 
     return chosen_plan, evaluations
@@ -778,7 +859,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://frontend:3000"],
+    allow_origins=[
+        "http://localhost:3800",
+        "http://frontend:3800",
+        "http://localhost:3000",
+        "http://frontend:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -820,12 +906,12 @@ async def optimize(req: OptimizeRequest):
 @app.post("/projections/generate")
 async def generate_projections_endpoint(
     start_gw: Optional[int] = None,
-    horizon: int = 5
+    horizon: int = 8
 ):
     """
     Triggers OpenFPL multi-gameweek forecasting engine:
-    Calculates fixture-based xG/xA and clean sheet expectations,
-    and updates the player_projections table in PostgreSQL.
+    Calculates multi-factor projections (real team GF/GA, actual returns, form, PPG,
+    finishing conversion, BPS, defensive contributions, and xGI) and updates PostgreSQL.
     """
     try:
         result = run_openfpl_pipeline(start_gw=start_gw, horizon=horizon)

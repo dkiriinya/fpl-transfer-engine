@@ -90,17 +90,26 @@ export default function ChipDeck({
       {/* Chip Selector Grid */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
         {evaluations.map((ev) => {
-          const isSelected = ev.chip_id === activeChip
-          const icon = CHIP_ICONS[ev.chip_id] ?? '⚽'
-          const verdictClass = VERDICT_STYLES[ev.verdict] ?? 'bg-slate-800 text-slate-300 border-border-hard'
+          const isUsed = ev.verdict.startsWith('USED')
+          const isSelected = ev.chip_id === activeChip && !isUsed
+          const icon = isUsed ? '🔒' : (CHIP_ICONS[ev.chip_id] ?? '⚽')
+          const verdictClass = isUsed
+            ? 'bg-slate-900/90 text-slate-500 border-slate-700/60'
+            : (VERDICT_STYLES[ev.verdict] ?? 'bg-slate-800 text-slate-300 border-border-hard')
           const gain = ev.points_gain_vs_standard
 
           return (
             <button
               key={ev.chip_id}
-              onClick={() => onSelectChip(ev.chip_id as ChipType)}
+              disabled={isUsed}
+              onClick={() => {
+                if (!isUsed) onSelectChip(ev.chip_id as ChipType)
+              }}
+              title={isUsed ? ev.reasoning : ev.description}
               className={`relative flex flex-col justify-between p-3 text-left rounded-sm border transition-all duration-150 ${
-                isSelected
+                isUsed
+                  ? 'bg-surface-canvas/50 border-border-hard/50 opacity-50 cursor-not-allowed'
+                  : isSelected
                   ? 'bg-surface-elevated border-accent-cyan ring-1 ring-accent-cyan shadow-md'
                   : 'bg-surface-card hover:bg-surface-elevated/70 border-border-hard hover:border-slate-600'
               }`}
@@ -109,33 +118,46 @@ export default function ChipDeck({
               <div className="flex items-center justify-between gap-1 w-full">
                 <div className="flex items-center gap-1.5">
                   <span className="text-sm">{icon}</span>
-                  <span className="font-heading text-xs font-bold text-text-primary truncate">
+                  <span className={`font-heading text-xs font-bold truncate ${isUsed ? 'text-text-muted line-through' : 'text-text-primary'}`}>
                     {ev.chip_name}
                   </span>
                 </div>
               </div>
 
-              {/* Middle Row: Net Points & Delta */}
+              {/* Middle Row: Net Points & Delta or Reset Notice */}
               <div className="my-2">
-                <div className="flex items-baseline gap-1">
-                  <span className="font-mono text-sm font-extrabold text-white tabular-nums">
-                    {ev.net_points.toFixed(1)}
-                  </span>
-                  <span className="font-mono text-[9px] text-text-secondary">
-                    {horizon > 1 ? `pts (${horizon}GW)` : `GW${gameweek} pts`}
-                  </span>
-                </div>
-
-                {ev.chip_id !== 'none' && (
-                  <div className="font-mono text-[10px] font-bold tabular-nums mt-0.5">
-                    {gain > 0 ? (
-                      <span className="text-accent-gain">+{gain.toFixed(1)} vs standard</span>
-                    ) : gain === 0 ? (
-                      <span className="text-text-muted">0.0 vs standard</span>
-                    ) : (
-                      <span className="text-accent-loss">{gain.toFixed(1)} vs standard</span>
-                    )}
+                {isUsed ? (
+                  <div className="flex flex-col gap-0.5">
+                    <span className="font-mono text-[10px] font-bold text-slate-400 uppercase">
+                      CHIP EXHAUSTED
+                    </span>
+                    <span className="font-mono text-[9px] text-slate-500">
+                      {isFirstHalf ? 'Resets after GW19' : 'Used in Set 2'}
+                    </span>
                   </div>
+                ) : (
+                  <>
+                    <div className="flex items-baseline gap-1">
+                      <span className="font-mono text-sm font-extrabold text-white tabular-nums">
+                        {ev.net_points.toFixed(1)}
+                      </span>
+                      <span className="font-mono text-[9px] text-text-secondary">
+                        {horizon > 1 ? `pts (${horizon}GW)` : `GW${gameweek} pts`}
+                      </span>
+                    </div>
+
+                    {ev.chip_id !== 'none' && (
+                      <div className="font-mono text-[10px] font-bold tabular-nums mt-0.5">
+                        {gain > 0 ? (
+                          <span className="text-accent-gain">+{gain.toFixed(1)} vs standard</span>
+                        ) : gain === 0 ? (
+                          <span className="text-text-muted">0.0 vs standard</span>
+                        ) : (
+                          <span className="text-accent-loss">{gain.toFixed(1)} vs standard</span>
+                        )}
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
 
@@ -144,7 +166,7 @@ export default function ChipDeck({
                 <span
                   className={`inline-block w-full text-center font-mono text-[8px] font-extrabold uppercase tracking-wider px-1.5 py-0.5 rounded-sm border ${verdictClass}`}
                 >
-                  {ev.verdict}
+                  {isUsed ? `${ev.verdict} · RESETS GW20` : ev.verdict}
                 </span>
               </div>
             </button>
