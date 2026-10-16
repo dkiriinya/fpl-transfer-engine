@@ -1,4 +1,4 @@
-﻿# -- Secrets (NEVER commit) ---------------------------------------------------
+# -- Secrets (NEVER commit) ---------------------------------------------------
 .env
 .env.local
 .env.*.local
@@ -36,3 +36,5 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+*Zone.Identifier*
+*:Zone.Identifier

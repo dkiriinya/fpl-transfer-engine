@@ -53,6 +53,7 @@ export interface OptimizeRequest {
   chip?: ChipType | string
   horizon?: number          // 1, 3, 5
   selling_prices?: Record<number, number>
+  allow_hits?: boolean
 }
 
 export interface OptimizeResponse {

@@ -9,7 +9,7 @@ import os
 import time
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, Union
 
 import httpx
 import psycopg2
@@ -33,7 +33,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OptimizeRequest(BaseModel):
-    team_id: int
+    team_id: Union[int, str]
     gameweek: int
     current_squad: List[int]      # 15 FPL player element IDs
     bank: float                    # Available budget in millions
@@ -42,6 +42,7 @@ class OptimizeRequest(BaseModel):
     chip: Optional[str] = "none"   # "none" | "wildcard" | "freehit" | "benchboost" | "triplecaptain"
     horizon: int = 1               # Planning horizon in gameweeks: 1, 3, 5
     selling_prices: Optional[Dict[int, float]] = None
+    allow_hits: bool = True        # True to allow at most 1 tactical -4pt hit; False for free transfers only
 
 
 class PlayerRec(BaseModel):
@@ -346,8 +347,9 @@ def solve_chip_plan(
         )
         h = pulp.LpVariable("hit_transfers", lowBound=0, cat="Integer")
         prob += h >= transfers_in - req.free_transfers
-        # Cap hits in standard play / BB / TC to at most 1 hit (max free_transfers + 1 transfers)
-        prob += h <= 1
+        # Cap hits: strictly 0 hits if allow_hits is False; at most 1 hit if allow_hits is True
+        max_hits = 1 if req.allow_hits else 0
+        prob += h <= max_hits
         hit_cost = h * HIT_PENALTY
     else:
         h = 0
@@ -361,12 +363,26 @@ def solve_chip_plan(
         if p["player_id"] in current_ids and p["projected_points"] >= (3.8 * h_scale)
     )
 
+    # Captaincy ceiling & EO weighting: accounts for forward brace/hat-trick variance and premium talisman protection
+    def get_captain_weight(p: dict) -> float:
+        xp = p["projected_points"]
+        mult = 1.0
+        if p.get("web_name") == "Haaland":
+            mult = 1.25  # High-EO talisman & penalty/hat-trick ceiling
+        elif p.get("price", 0) >= 12.0:
+            mult = 1.15  # Premium assets (e.g. Salah)
+        elif p.get("position") == "FWD":
+            mult = 1.08  # Forward goal clustering variance
+        return round(xp * mult, 3)
+
+    cap_scores = {p["player_id"]: get_captain_weight(p) for p in player_pool}
+
     # Objective Function
     if chip_mode == "benchboost":
         # All 15 players score + captain bonus
         prob += (
             pulp.lpSum(p["projected_points"] * s[p["player_id"]] for p in player_pool)
-            + pulp.lpSum(p["projected_points"] * c[p["player_id"]] for p in player_pool)
+            + pulp.lpSum(cap_scores[p["player_id"]] * c[p["player_id"]] for p in player_pool)
             + retention_bonus
             - hit_cost
         )
@@ -374,7 +390,7 @@ def solve_chip_plan(
         # Starters score + 2x captain bonus + bench tiebreaker
         prob += (
             pulp.lpSum(p["projected_points"] * x[p["player_id"]] for p in player_pool)
-            + 2 * pulp.lpSum(p["projected_points"] * c[p["player_id"]] for p in player_pool)
+            + 2 * pulp.lpSum(cap_scores[p["player_id"]] * c[p["player_id"]] for p in player_pool)
             + 0.05 * pulp.lpSum(p["projected_points"] * (s[p["player_id"]] - x[p["player_id"]]) for p in player_pool)
             + retention_bonus
             - hit_cost
@@ -385,7 +401,7 @@ def solve_chip_plan(
         prob += (
             0.50 * pulp.lpSum(p["projected_points"] * x[p["player_id"]] for p in player_pool)
             + 0.50 * pulp.lpSum((lt_by_id.get(p["player_id"], p["projected_points"]) * lt_scale) * x[p["player_id"]] for p in player_pool)
-            + pulp.lpSum(p["projected_points"] * c[p["player_id"]] for p in player_pool)
+            + pulp.lpSum(cap_scores[p["player_id"]] * c[p["player_id"]] for p in player_pool)
             + 0.12 * pulp.lpSum((lt_by_id.get(p["player_id"], p["projected_points"]) * lt_scale) * (s[p["player_id"]] - x[p["player_id"]]) for p in player_pool)
             + retention_bonus
             - hit_cost
@@ -394,7 +410,7 @@ def solve_chip_plan(
         # Standard, Free Hit, or Wildcard when already on 4+ GW horizon
         prob += (
             pulp.lpSum(p["projected_points"] * x[p["player_id"]] for p in player_pool)
-            + pulp.lpSum(p["projected_points"] * c[p["player_id"]] for p in player_pool)
+            + pulp.lpSum(cap_scores[p["player_id"]] * c[p["player_id"]] for p in player_pool)
             + 0.05 * pulp.lpSum(p["projected_points"] * (s[p["player_id"]] - x[p["player_id"]]) for p in player_pool)
             + (0 if chip_mode == "freehit" else retention_bonus)
             - hit_cost

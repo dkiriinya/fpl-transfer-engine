@@ -142,7 +142,7 @@ async function calculateFreeTransfers(
           }
 
           if (unlimitedChipGws.has(ev.event)) {
-            // Wildcard / Free Hit preserves banked free transfers but does not roll a new one
+            // Wildcard / Free Hit preserves banked free transfers (does not award extra banked roll)
             ft = Math.max(1, Math.min(5, ft))
           } else {
             const used = ev.event_transfers ?? 0
