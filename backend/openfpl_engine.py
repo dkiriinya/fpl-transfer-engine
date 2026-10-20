@@ -134,8 +134,9 @@ def compute_team_ratings(teams: List[dict], fixtures: List[dict]) -> Dict[int, D
 def calculate_expected_minutes(player: dict, team_gp: float = 6.0) -> float:
     """
     Calculate player expected minutes using availability, starts share across
-    team games played, minutes per start, and recent form.
-    Prevents cameo substitutes from getting 90 expected minutes.
+    team games played, minutes per start, form, and rotation volatility.
+    Prevents cameo substitutes and rotated wingers/attackers (e.g. Maresca/Pep systems)
+    from getting inflated expected minutes.
     """
     status = player.get("status", "a")
     chance_raw = player.get("chance_of_playing_next_round")
@@ -165,22 +166,40 @@ def calculate_expected_minutes(player: dict, team_gp: float = 6.0) -> float:
     mins_per_team_game = min(90.0, minutes / eff_gp)
     avg_start_mins = min(90.0, minutes / max(1.0, starts))
     form_val = float(player.get("form") or 0.0)
+    now_cost = float(player.get("now_cost", 40)) / 10.0
+    pos = int(player.get("element_type", 3))
 
     if starts >= eff_gp:
-        # Started every match for their club
-        base_mins = max(75.0, avg_start_mins)
-    elif starts >= eff_gp - 1.0 and avg_start_mins >= 78.0 and form_val >= 4.0:
-        # First-choice starter who missed at most 1 match and is in active form
+        # Started every single match for their club without missing any
+        base_mins = max(70.0, avg_start_mins)
+    elif starts >= eff_gp - 1.0 and avg_start_mins >= 82.0 and form_val >= 5.0 and now_cost >= 11.0:
+        # Untouchable marquee talisman (e.g. Haaland/Salah/Palmer) who missed at most 1 match
         base_mins = max(74.0, 0.75 * avg_start_mins + 0.25 * mins_per_team_game)
+    elif starts >= eff_gp - 1.0 and avg_start_mins >= 75.0 and mins_per_team_game >= 68.0:
+        # Regular first-team starter with stable minutes
+        base_mins = min(avg_start_mins, 0.60 * avg_start_mins + 0.40 * mins_per_team_game)
     elif starts >= 2.0:
-        # Rotation starter or frequent substitute
-        base_mins = 0.65 * mins_per_team_game + 0.35 * (avg_start_mins * start_rate)
+        # Rotation starter or frequent substitute (e.g. Maresca / Pep rotated wingers)
+        # Directly anchor to their real-world minutes per team game
+        base_mins = 0.70 * mins_per_team_game + 0.30 * (avg_start_mins * start_rate)
     elif starts == 1.0:
-        base_mins = max(20.0, mins_per_team_game)
+        base_mins = max(15.0, 0.50 * mins_per_team_game)
     elif minutes >= 45.0:
-        base_mins = min(30.0, max(12.0, mins_per_team_game))
+        base_mins = min(25.0, max(10.0, mins_per_team_game))
     else:
-        base_mins = 6.0 if status == "a" else 0.0
+        base_mins = 5.0 if status == "a" else 0.0
+
+    # ── Tier 1: Rotation Volatility Penalty for High-Depth Squads ──
+    # Attackers/wingers (MID, FWD) in deep squads who are rotated or hooked early (<70 min avg)
+    # suffer from manager rotation (Maresca, Pep, etc.)
+    team_id = int(player.get("team") or 0)
+    # High-rotation attacking teams: Chelsea (7), Man City (13), Arsenal (1), Liverpool (12), Newcastle (15)
+    high_rotation_teams = {1, 7, 12, 13, 15}
+    if team_id in high_rotation_teams and pos in (3, 4) and now_cost < 11.0:
+        # If they've missed any start or their avg start is under 75 mins, they're in the rotation blender
+        if starts < eff_gp or avg_start_mins < 75.0:
+            volatility_factor = max(0.70, min(0.90, (mins_per_team_game / 75.0) ** 0.5))
+            base_mins = base_mins * volatility_factor
 
     return round(min(90.0, base_mins) * chance, 1)
 

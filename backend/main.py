@@ -21,6 +21,13 @@ from pydantic import BaseModel
 import pulp
 from openfpl_engine import run_openfpl_pipeline
 from scheduler import scheduler
+from leaks import (
+    record_player_leak,
+    get_active_leaks,
+    delete_player_leak,
+    parse_and_apply_leak_message,
+    init_leaks_table,
+)
 
 load_dotenv()
 
@@ -44,6 +51,16 @@ class OptimizeRequest(BaseModel):
     horizon: int = 1               # Planning horizon in gameweeks: 1, 3, 5
     selling_prices: Optional[Dict[int, float]] = None
     allow_hits: bool = True        # True to allow at most 1 tactical -4pt hit; False for free transfers only
+    excluded_players: Optional[List[int]] = None  # Tier 3: IDs to strictly exclude from 15-man squad
+    benched_players: Optional[List[int]] = None   # Tier 3: IDs forced onto the bench (x[i] == 0)
+
+
+class LeakReportRequest(BaseModel):
+    player: Union[int, str]        # Player ID or player name (e.g. 399 or "Cherki")
+    status: str                    # "benched" | "out" | "starting"
+    gameweek: Optional[int] = None # Defaults to active planning gameweek
+    source: Optional[str] = "manual"
+    raw_message: Optional[str] = None
 
 
 class PlayerRec(BaseModel):
@@ -355,6 +372,31 @@ def solve_chip_plan(
     teams_in_pool = {p["team"] for p in player_pool}
     for team in teams_in_pool:
         prob += pulp.lpSum(s[p["player_id"]] for p in player_pool if p["team"] == team) <= MAX_PER_TEAM
+
+    # Tier 3: Requested player exclusions (strictly exclude from 15-man squad)
+    if req.excluded_players:
+        for pid in req.excluded_players:
+            if pid in s:
+                prob += s[pid] == 0
+
+    # Tier 3: Requested benched players (strictly sit on bench, x[pid] == 0)
+    if req.benched_players:
+        for pid in req.benched_players:
+            if pid in x:
+                prob += x[pid] == 0
+
+    # Tier 2: Enforce active database leaks for this gameweek
+    try:
+        active_leaks = get_active_leaks(req.gameweek)
+        for lk in active_leaks:
+            pid = lk["player_id"]
+            st = lk.get("status")
+            if st == "out" and pid in s:
+                prob += s[pid] == 0
+            elif st == "benched" and pid in x:
+                prob += x[pid] == 0
+    except Exception as e:
+        logger.warning(f"[Solver] Could not query active leaks: {e}")
 
     is_unlimited = chip_mode in ("wildcard", "freehit") or req.wildcard_active
 
@@ -963,4 +1005,72 @@ async def generate_projections_endpoint(
     if result.get("status") == "error":
         raise HTTPException(status_code=500, detail=result.get("error", "Sync failed"))
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Leaks & Team News Endpoints (Tier 2 & Tier 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/leaks")
+async def report_leak(req: LeakReportRequest):
+    """
+    Tier 2/3: Record a confirmed lineup leak for a player (e.g. 'Cherki' benched/out).
+    Immediately adjusts player's expected minutes and points in PostgreSQL.
+    """
+    try:
+        res = record_player_leak(
+            identifier=req.player,
+            status=req.status,
+            gameweek=req.gameweek,
+            source=req.source or "manual",
+            raw_message=req.raw_message,
+        )
+        return {"status": "success", "leak": res}
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
+        logger.error(f"[Leaks API] Failed to report leak: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/leaks")
+async def list_active_leaks(gameweek: Optional[int] = None):
+    """Returns active lineup leaks for the target gameweek or past 4 days."""
+    try:
+        leaks = get_active_leaks(gameweek=gameweek)
+        return {"gameweek": gameweek, "count": len(leaks), "leaks": leaks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/leaks/{player_id}")
+async def remove_leak(player_id: int, gameweek: Optional[int] = None):
+    """Removes a leak record and clears its override."""
+    from leaks import get_current_planning_gw
+    gw = gameweek or get_current_planning_gw()
+    deleted = delete_player_leak(player_id, gw)
+    return {"status": "success" if deleted else "not_found", "player_id": player_id, "gameweek": gw}
+
+
+@app.post("/leaks/webhook")
+async def leaks_webhook(payload: Dict[str, Any]):
+    """
+    Tier 2 Automated Webhook:
+    Accepts raw payloads from Telegram bots, Discord bots, or n8n triggers.
+    Parses message text for player names and actions (benched, out, starts)
+    and automatically adjusts player projections.
+    """
+    text = (
+        payload.get("message", {}).get("text")
+        or payload.get("text")
+        or payload.get("content")
+        or payload.get("raw")
+        or ""
+    )
+    if not text:
+        return {"status": "ignored", "message": "No text content found in payload"}
+
+    applied = parse_and_apply_leak_message(text, source=payload.get("source", "telegram_webhook"))
+    return {"status": "processed", "text_received": text, "applied_count": len(applied), "leaks_applied": applied}
+
 

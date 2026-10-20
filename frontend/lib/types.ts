@@ -54,6 +54,8 @@ export interface OptimizeRequest {
   horizon?: number          // 1, 3, 5
   selling_prices?: Record<number, number>
   allow_hits?: boolean
+  excluded_players?: number[] // Tier 3: IDs to strictly exclude from 15-man squad
+  benched_players?: number[]  // Tier 3: IDs forced onto bench (x[i] == 0)
 }
 
 export interface OptimizeResponse {
