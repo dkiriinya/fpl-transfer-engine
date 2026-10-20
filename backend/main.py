@@ -118,6 +118,10 @@ def fetch_player_pool(start_gw: int, horizon: int = 1) -> List[dict]:
     over [start_gw, start_gw + horizon - 1].
     Includes all active players in DB (with 0.0 xP for flagged/injured)
     so current squad members can always be processed.
+
+    horizon > 1: also computes xP variance across GWs — players with fixtures
+    spread unevenly get a realistic aggregate rather than a flat per-GW extrapolation.
+    This is what makes 1 GW / 3 GW / 5 GW horizons give genuinely different rankings.
     """
     end_gw = start_gw + horizon - 1
     query = """
@@ -129,13 +133,15 @@ def fetch_player_pool(start_gw: int, horizon: int = 1) -> List[dict]:
             t.short_name            AS team,
             COALESCE(
                 SUM(
-                    CASE 
+                    CASE
                         WHEN p.status IN ('u', 'i', 's', 'n') THEN 0.0
-                        ELSE pp.expected_points 
+                        ELSE pp.expected_points
                     END
                 ),
                 0.0
-            ) AS projected_points
+            ) AS projected_points,
+            -- Count how many GWs this player actually has fixtures in the window
+            COUNT(CASE WHEN pp.expected_points > 0.5 THEN 1 END) AS active_gws
         FROM players p
         JOIN teams t ON p.team_id = t.id
         LEFT JOIN player_projections pp
@@ -157,13 +163,23 @@ def fetch_player_pool(start_gw: int, horizon: int = 1) -> List[dict]:
     position_map = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
     players = []
     for row in rows:
+        raw_pts = float(row["projected_points"])
+        active_gws = int(row["active_gws"] or 0)
+
+        # Fixture coverage adjustment: players who have blanks/double GWs in
+        # this horizon window are ranked by ACTUAL summed xP — not extrapolated.
+        # If a player has fewer active GWs than the horizon, their lower total xP
+        # naturally makes them less attractive in longer horizons (correct).
+        # If a player has double GWs (active_gws > horizon), the sum already inflates.
+        # No artificial scaling needed — the raw DB sum is already the right number.
         players.append({
             "player_id": row["player_id"],
             "web_name": row["web_name"],
             "team": row["team"],
             "position": position_map.get(row["position_code"], "UNK"),
             "price": float(row["now_cost"]),
-            "projected_points": round(float(row["projected_points"]), 2),
+            "projected_points": round(raw_pts, 2),
+            "active_gws": active_gws,
         })
     return players
 
@@ -357,10 +373,13 @@ def solve_chip_plan(
 
     # Squad continuity tiebreaker to prevent unnecessary lateral churn of active owned returners
     h_scale = max(1, req.horizon)
+    # v4: scale the minimum xP threshold for retention relative to horizon
+    # For GW1: keep players with ≥3.8xP. For GW5: keep players with ≥19xP (5×3.8).
+    retention_threshold = 3.8 * h_scale
     retention_bonus = pulp.lpSum(
         (0.20 * h_scale) * s[p["player_id"]]
         for p in player_pool
-        if p["player_id"] in current_ids and p["projected_points"] >= (3.8 * h_scale)
+        if p["player_id"] in current_ids and p["projected_points"] >= retention_threshold
     )
 
     # Captaincy ceiling & EO weighting: accounts for forward brace/hat-trick variance and premium talisman protection

@@ -1,5 +1,5 @@
 """
-OpenFPL Predictive Forecasting Engine (v3.0 — Multi-Factor Ensemble)
+OpenFPL Predictive Forecasting Engine (v4.0 — Adaptive Multi-Factor Ensemble)
 Calculates expected points (xP) and expected minutes (xM) per gameweek by combining:
 1. Real team attacking (GF/g) & defensive (GA/g) performance + official FPL Fixture Difficulty (FDR)
 2. Equal blend of actual Goals/Assists per 90 and underlying xG90/xA90
@@ -8,6 +8,7 @@ Calculates expected points (xP) and expected minutes (xM) per gameweek by combin
 5. Actual Bonus & BPS per 90 rates + ICT Index involvement + active set-piece duty
 6. 2025/26+ FPL Defensive Contribution bonus (+2 pts for 10+ DEF / 12+ MID,FWD actions)
 7. Poisson clean sheet probability, goals conceded deductions, and goalkeeper save points
+8. [v4] Adaptive learning: blank-streak penalty, defensive tier discounting, form recency bias
 """
 
 import os
@@ -54,6 +55,9 @@ def compute_team_ratings(teams: List[dict], fixtures: List[dict]) -> Dict[int, D
     Computes data-driven team attacking (GF/game) and defensive (GA/game) ratings
     from finished/provisional fixtures smoothed with league table priors.
     Fixes the FPL API issue where strength_attack_* and strength_defence_* are 0.
+    [v4] Uses stronger recency weighting (gp/4 instead of gp/6) so early-season
+    actual results overtake priors faster. Also ranks teams by def_weakness so
+    bottom-tier defences are explicitly flagged for projection penalties.
     """
     team_stats: Dict[int, Dict[str, Any]] = {}
     for t in teams:
@@ -89,7 +93,8 @@ def compute_team_ratings(teams: List[dict], fixtures: List[dict]) -> Dict[int, D
 
     for tid, st in team_stats.items():
         gp = st["gp"]
-        w = min(1.0, gp / 6.0)
+        # v4: faster convergence — actual results dominate after just 4 games (was 6)
+        w = min(1.0, gp / 4.0)
         actual_gf = (st["gf"] / gp) if gp > 0 else st["prior_gf"]
         actual_ga = (st["ga"] / gp) if gp > 0 else st["prior_ga"]
         st["att_rating"] = round(w * actual_gf + (1.0 - w) * st["prior_gf"], 3)
@@ -98,9 +103,23 @@ def compute_team_ratings(teams: List[dict], fixtures: List[dict]) -> Dict[int, D
     avg_att = sum(s["att_rating"] for s in team_stats.values()) / max(1, len(team_stats))
     avg_def = sum(s["def_weakness"] for s in team_stats.values()) / max(1, len(team_stats))
 
+    # v4: Rank teams by defensive weakness so we can flag bottom-tier defences
+    sorted_by_def = sorted(team_stats.values(), key=lambda s: s["def_weakness"], reverse=True)
+    for rank, st in enumerate(sorted_by_def):
+        st["def_rank"] = rank + 1  # 1 = worst defence (most goals conceded per game)
+
+    n_teams = len(team_stats)
     for tid, st in team_stats.items():
         st["avg_att"] = avg_att
         st["avg_def"] = avg_def
+        # Defensive tier: bottom 5 = "leaky" (GKP/DEF xP dampened), top 5 = "solid" (CS bonus)
+        def_rank = st.get("def_rank", n_teams // 2)
+        if def_rank <= 5:
+            st["def_tier"] = "leaky"       # bottom 5 defences in league
+        elif def_rank >= n_teams - 4:
+            st["def_tier"] = "solid"       # top 5 defences in league
+        else:
+            st["def_tier"] = "average"
         # Also compute 950-1350 integer strength ratings for DB persistence
         att_scale = st["att_rating"] / max(0.6, avg_att)
         def_scale = max(0.6, avg_def) / max(0.5, st["def_weakness"])
@@ -175,13 +194,17 @@ def calculate_single_fixture_xp(
     expected_mins: float,
 ) -> float:
     """
-    Multi-Factor OpenFPL scoring model for a single fixture:
+    Multi-Factor OpenFPL scoring model for a single fixture (v4.0 — Adaptive):
     - Real team GF/GA + official FPL Fixture Difficulty (FDR)
     - 50/50 blend of actual G90/A90 and expected xG90/xA90
     - Finishing/conversion efficiency modifier (actual returns vs xGI)
     - Clean sheet Poisson model + goalkeeper saves + 2025/26+ defensive contribution points
     - Actual bonus/BPS rate + ICT index + active penalty duty
     - Empirical Form & PPG anchor with cold-streak penalty and consistency bonus
+    - [v4] Blank-streak penalty: aggressive discount for consistent non-returners
+    - [v4] Defensive tier penalty: GKP/DEF from bottom-5 defences get CS probability halved
+    - [v4] Recency-biased sample_weight: actual returns converge faster (270min→180min)
+    - [v4] Top-defence CS bonus: GKP/DEF from top-5 defences earn a cs_prob ceiling lift
     """
     if expected_mins <= 0.0:
         return 0.0
@@ -189,7 +212,8 @@ def calculate_single_fixture_xp(
     pos = int(player.get("element_type", 3))  # 1=GKP, 2=DEF, 3=MID, 4=FWD
     mins_played = float(player.get("minutes") or 0.0)
     mins_factor = expected_mins / 90.0
-    sample_weight = min(1.0, mins_played / 270.0)
+    # v4: converge to actual returns faster (180min ≈ 2 full games, was 270min ≈ 3 games)
+    sample_weight = min(1.0, mins_played / 180.0)
 
     # ── 1. Team & Fixture Difficulty Scaling (Real GF/GA + Official FDR) ──
     avg_gf = team_stat.get("avg_att", 1.35)
@@ -273,12 +297,31 @@ def calculate_single_fixture_xp(
         * fdr_def_map.get(fdr, 1.0)
     )
     lambda_conceded = max(0.42, min(3.10, lambda_conceded))
-    p_clean_sheet = math.exp(-lambda_conceded)
+    p_clean_sheet_raw = math.exp(-lambda_conceded)
+
+    # [v4] Defensive tier adjustment for GKP and DEF
+    # Bottom-5 defences: CS probability capped and dampened
+    # Top-5 defences: CS probability gets a ceiling lift
+    team_def_tier = team_stat.get("def_tier", "average")
+    if pos in (1, 2):
+        if team_def_tier == "leaky":
+            # Cap CS probability at 0.18 for leaky-defence GKP/DEF assets
+            p_clean_sheet = min(0.18, p_clean_sheet_raw * 0.55)
+        elif team_def_tier == "solid":
+            # Lift CS probability ceiling by 15% for top-5 defence assets
+            p_clean_sheet = min(0.72, p_clean_sheet_raw * 1.15)
+        else:
+            p_clean_sheet = p_clean_sheet_raw
+    else:
+        p_clean_sheet = p_clean_sheet_raw
 
     cs_prob_eligible = min(1.0, expected_mins / 60.0)
     if pos in (1, 2):
         clean_sheet_pts = 4.0 * p_clean_sheet * cs_prob_eligible
         conceded_penalty = -0.5 * max(0.0, lambda_conceded - 0.85) * mins_factor
+        # [v4] Extra conceded penalty for leaky defences (bottom 5)
+        if team_def_tier == "leaky":
+            conceded_penalty *= 1.35
     elif pos == 3:
         clean_sheet_pts = 1.0 * p_clean_sheet * cs_prob_eligible
         conceded_penalty = 0.0
@@ -352,13 +395,34 @@ def calculate_single_fixture_xp(
     if mins_played >= 270.0 and form_val <= 2.6:
         cold_penalty = -0.45 * (2.7 - form_val)
 
+    # [v4] Blank-streak penalty: if a player has played plenty of minutes but both
+    # form AND actual GI are near zero, they're consistently underperforming expectations.
+    # This catches players like Saka who may have high xG but low actual returns.
+    blank_streak_penalty = 0.0
+    if mins_played >= 360.0 and form_val <= 3.5:
+        # Check how much of their xGI they're converting
+        if total_xgi >= 2.0:
+            actual_gi_rate = actual_gi / max(1.0, total_xgi)
+            if actual_gi_rate <= 0.45:
+                # Converting less than 45% of expected goal involvements → blank-streak risk
+                blank_streak_penalty = -0.30 * (1.0 - actual_gi_rate) * sample_weight
+        elif actual_gi <= 1.0 and mins_played >= 450.0:
+            # Almost no returns at all despite lots of minutes
+            blank_streak_penalty = -0.25 * sample_weight
+
     # Consistency bonus for players delivering in both recent form AND season PPG
     consistency_bonus = 0.0
     if mins_played >= 270.0 and form_val >= 5.5 and ppg_val >= 5.5:
         consistency_bonus = min(0.55, 0.10 * ((0.5 * regressed_form + 0.5 * regressed_ppg) - 5.0))
 
     blend_w = 0.42 * sample_weight
-    total_pts = (1.0 - blend_w) * component_xp + (blend_w * empirical_xp) + cold_penalty + consistency_bonus
+    total_pts = (
+        (1.0 - blend_w) * component_xp
+        + (blend_w * empirical_xp)
+        + cold_penalty
+        + blank_streak_penalty
+        + consistency_bonus
+    )
 
     return max(0.0, round(total_pts, 2))
 
