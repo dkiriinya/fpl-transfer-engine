@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pulp
 from openfpl_engine import run_openfpl_pipeline
+from scheduler import scheduler
 
 load_dotenv()
 
@@ -881,14 +882,18 @@ async def lifespan(app: FastAPI):
         logger.info("Database connection: OK")
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
+
+    # Start autonomous background scheduler (daily sync + pre-deadline refresh)
+    scheduler.start()
     yield
+    scheduler.stop()
     logger.info("FPL Solver shutting down")
 
 
 app = FastAPI(
     title="FPL Transfer Decision Engine",
     description="MILP-based FPL squad & chip optimiser with multi-horizon support. Reads from Neon PostgreSQL.",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
@@ -938,6 +943,12 @@ async def optimize(req: OptimizeRequest):
     return result
 
 
+@app.get("/scheduler/status")
+async def scheduler_status():
+    """Returns autonomous background scheduler metrics and next deadline window."""
+    return scheduler.get_status()
+
+
 @app.post("/projections/generate")
 async def generate_projections_endpoint(
     start_gw: Optional[int] = None,
@@ -948,10 +959,8 @@ async def generate_projections_endpoint(
     Calculates multi-factor projections (real team GF/GA, actual returns, form, PPG,
     finishing conversion, BPS, defensive contributions, and xGI) and updates PostgreSQL.
     """
-    try:
-        result = run_openfpl_pipeline(start_gw=start_gw, horizon=horizon)
-        return result
-    except Exception as e:
-        logger.error(f"OpenFPL projection pipeline failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await scheduler.run_sync(reason="manual_endpoint", horizon=horizon)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=500, detail=result.get("error", "Sync failed"))
+    return result
 
