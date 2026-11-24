@@ -101,17 +101,24 @@ async function calculateFreeTransfers(
   targetGw: number,
   headers: Record<string, string>,
   fallbackActiveChip?: string | null,
-  fallbackEventTransfers?: number
+  fallbackEventTransfers?: number,
+  preloadedHistData?: any
 ): Promise<number> {
   if (targetGw <= 1) return 1
 
   try {
-    const histRes = await fetch(`${FPL_BASE}/entry/${teamId}/history/`, {
-      headers,
-      cache: 'no-store',
-    })
-    if (histRes.ok) {
-      const histData = await histRes.json()
+    let histData = preloadedHistData
+    if (!histData) {
+      const histRes = await fetch(`${FPL_BASE}/entry/${teamId}/history/`, {
+        headers,
+        cache: 'no-store',
+      })
+      if (histRes.ok) {
+        histData = await histRes.json()
+      }
+    }
+
+    if (histData) {
       const current: Array<{ event: number; event_transfers?: number }> = Array.isArray(
         histData?.current
       )
@@ -203,15 +210,23 @@ export async function fetchSquadFromFPL(teamId: string, gw: string) {
   }
 
   // 2. Target GW is in the future (FPL returns 404 for unplayed GWs).
-  // Fetch entry details to find the current/latest available event
+  // Fetch entry details and history to find the current event and chips history
   let latestEvent = targetGw - 1
   let entryData: any = null
+  let histData: any = null
 
   try {
-    const entryRes = await fetch(`${FPL_BASE}/entry/${teamId}/`, {
-      headers,
-      cache: 'no-store',
-    })
+    const [entryRes, histRes] = await Promise.all([
+      fetch(`${FPL_BASE}/entry/${teamId}/`, {
+        headers,
+        cache: 'no-store',
+      }),
+      fetch(`${FPL_BASE}/entry/${teamId}/history/`, {
+        headers,
+        cache: 'no-store',
+      }),
+    ])
+
     if (entryRes.ok) {
       entryData = await entryRes.json()
       if (entryData && entryData.current_event) {
@@ -223,12 +238,37 @@ export async function fetchSquadFromFPL(teamId: string, gw: string) {
         status: 404,
       }
     }
+
+    if (histRes.ok) {
+      histData = await histRes.json()
+    }
   } catch (e) {
     // Continue with fallback decrement
   }
 
-  // 3. Fallback: Search backwards from latestEvent down to GW 1
+  // Track Free Hit gameweeks: Free Hit squads are temporary and revert at the next gameweek.
+  const freeHitGws = new Set<number>()
+  for (const c of histData?.chips ?? []) {
+    if (c && c.name === 'freehit' && typeof c.event === 'number') {
+      freeHitGws.add(c.event)
+    }
+  }
+
+  let revertedFromFreeHit = false
+  let freeHitEvent: number | null = null
+
+  // 3. Fallback: Search backwards from latestEvent down to GW 1.
+  // If targetGw is upcoming (unplayed), any prior Free Hit squad expired at the deadline,
+  // reverting the manager's team back to their pre-Free Hit squad.
   for (let g = Math.min(latestEvent, targetGw); g >= 1; g--) {
+    // If g was a Free Hit gameweek and targetGw is after it, the squad has reverted.
+    if (g < targetGw && freeHitGws.has(g)) {
+      revertedFromFreeHit = true
+      freeHitEvent = g
+      console.log(`[fpl-server] GW${g} was a Free Hit chip; skipping to find reverted pre-Free Hit squad for GW${targetGw}`)
+      continue
+    }
+
     try {
       const fallbackRes = await fetch(`${FPL_BASE}/entry/${teamId}/event/${g}/picks/`, {
         headers,
@@ -237,27 +277,46 @@ export async function fetchSquadFromFPL(teamId: string, gw: string) {
       if (fallbackRes.ok) {
         const data = await fallbackRes.json()
         if (data && data.picks && data.picks.length > 0) {
-          if (!data.entry_history && entryData) {
-            data.entry_history = {
-              bank: entryData.last_deadline_bank ?? 0,
-              event_transfers: 0,
-              event_transfers_cost: 0,
-              points: 0,
-              total_points: entryData.summary_overall_points ?? 0,
-            }
+          // Additional safety check if active_chip in data is freehit
+          if (g < targetGw && data.active_chip === 'freehit') {
+            revertedFromFreeHit = true
+            freeHitEvent = g
+            freeHitGws.add(g)
+            console.log(`[fpl-server] GW${g} picks had active_chip=freehit; skipping for upcoming GW${targetGw}`)
+            continue
           }
+
           const freeTransfers = await calculateFreeTransfers(
             teamId,
             targetGw,
             headers,
-            data.active_chip,
-            data.entry_history?.event_transfers
+            revertedFromFreeHit ? 'freehit' : data.active_chip,
+            data.entry_history?.event_transfers,
+            histData
           )
+
+          const squadBank = data.entry_history?.bank ?? (entryData?.last_deadline_bank ?? 0)
+          const totalPoints = entryData?.summary_overall_points ?? (data.entry_history?.total_points ?? 0)
+
+          const entryHistory = {
+            ...(data.entry_history || {}),
+            bank: squadBank,
+            event_transfers: 0,
+            event_transfers_cost: 0,
+            points: 0,
+            total_points: totalPoints,
+          }
+
           return {
             data: {
               ...data,
+              entry_history: entryHistory,
               is_exact_gw: false,
+              active_chip: null, // Upcoming gameweek has no active chip applied yet
               free_transfers: freeTransfers,
+              reverted_from_freehit: revertedFromFreeHit,
+              source_gw: g,
+              free_hit_gw: freeHitEvent,
             },
             status: 200,
           }

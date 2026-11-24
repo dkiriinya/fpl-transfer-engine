@@ -16,6 +16,7 @@ export default function Home() {
   const [teamId, setTeamId] = useState<number | null>(null)
   const [gameweek, setGameweek] = useState<number | null>(null)
   const [horizon, setHorizon] = useState<number>(1)
+  const [allowHits, setAllowHits] = useState<boolean>(false)
   const [events, setEvents] = useState<
     Array<{ id: number; name: string; finished: boolean; is_current: boolean; is_next: boolean }>
   >([])
@@ -27,8 +28,12 @@ export default function Home() {
   const [initialized, setInitialized] = useState(false)
   const [showSetup, setShowSetup] = useState(false)
 
-  // Resolve team ID from localStorage or env constant on mount
+  // Resolve team ID and hit preference from localStorage or env constant on mount
   useEffect(() => {
+    const storedHits = localStorage.getItem('fpl_allow_hits')
+    if (storedHits === 'true') {
+      setAllowHits(true)
+    }
     const stored = localStorage.getItem('fpl_team_id')
     if (stored) {
       setTeamId(parseInt(stored, 10))
@@ -42,7 +47,12 @@ export default function Home() {
   }, [])
 
   const runPipeline = useCallback(
-    async (tid: number, targetGw?: number, targetHorizon: number = 1) => {
+    async (
+      tid: number,
+      targetGw?: number,
+      targetHorizon: number = 1,
+      targetAllowHits: boolean = false
+    ) => {
       setIsLoading(true)
       setError(null)
       try {
@@ -88,6 +98,7 @@ export default function Home() {
             wildcard_active: false,
             chip: 'none',
             horizon: targetHorizon,
+            allow_hits: targetAllowHits,
           })
           setResult(optimizeResult)
         }
@@ -104,7 +115,7 @@ export default function Home() {
   // Auto-trigger pipeline when teamId resolves
   useEffect(() => {
     if (teamId && initialized) {
-      runPipeline(teamId, gameweek ?? undefined, horizon)
+      runPipeline(teamId, gameweek ?? undefined, horizon, allowHits)
     }
   }, [teamId, initialized])
 
@@ -126,14 +137,22 @@ export default function Home() {
   function handleSelectGameweek(newGw: number) {
     if (teamId) {
       setGameweek(newGw)
-      runPipeline(teamId, newGw, horizon)
+      runPipeline(teamId, newGw, horizon, allowHits)
     }
   }
 
   function handleSelectHorizon(newH: number) {
     if (teamId && gameweek) {
       setHorizon(newH)
-      runPipeline(teamId, gameweek, newH)
+      runPipeline(teamId, gameweek, newH, allowHits)
+    }
+  }
+
+  function handleToggleAllowHits(nextAllow: boolean) {
+    setAllowHits(nextAllow)
+    localStorage.setItem('fpl_allow_hits', String(nextAllow))
+    if (teamId && gameweek) {
+      runPipeline(teamId, gameweek, horizon, nextAllow)
     }
   }
 
@@ -153,7 +172,7 @@ export default function Home() {
           </p>
           <p className="font-mono text-xs text-text-secondary leading-relaxed">{error}</p>
           <button
-            onClick={() => teamId && runPipeline(teamId, gameweek ?? undefined, horizon)}
+            onClick={() => teamId && runPipeline(teamId, gameweek ?? undefined, horizon, allowHits)}
             className="mt-4 w-full font-mono text-xs uppercase tracking-widest text-text-primary bg-surface-elevated border border-border-hard px-4 py-3 hover:border-accent-cyan hover:text-accent-cyan transition-colors rounded-sm"
             style={{ minHeight: '44px' }}
           >
@@ -173,6 +192,7 @@ export default function Home() {
       teamId={teamId!}
       gameweek={gameweek}
       horizon={horizon}
+      allowHits={allowHits}
       events={events}
       squad={squad}
       result={result}
@@ -180,8 +200,9 @@ export default function Home() {
       isLoading={isLoading}
       onSelectGameweek={handleSelectGameweek}
       onSelectHorizon={handleSelectHorizon}
+      onToggleAllowHits={handleToggleAllowHits}
       onChangeTeam={handleChangeTeam}
-      onRefresh={() => teamId && runPipeline(teamId, gameweek, horizon)}
+      onRefresh={() => teamId && runPipeline(teamId, gameweek, horizon, allowHits)}
     />
   )
 }

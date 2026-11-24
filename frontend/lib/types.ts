@@ -98,6 +98,9 @@ export interface FPLSquadResponse {
   active_chip?: string | null
   is_exact_gw?: boolean
   free_transfers?: number
+  reverted_from_freehit?: boolean
+  source_gw?: number
+  free_hit_gw?: number | null
   actual_lineup?: ActualLineupSnapshot
   entry_history: {
     bank: number           // raw value — divide by 10 for millions

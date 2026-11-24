@@ -4,6 +4,7 @@ interface HeaderBarProps {
   teamId: number
   gameweek: number
   horizon: number
+  allowHits: boolean
   bankBalance: number
   isLockedGw?: boolean
   events?: Array<{
@@ -15,6 +16,7 @@ interface HeaderBarProps {
   }>
   onSelectGameweek: (gw: number) => void
   onSelectHorizon: (h: number) => void
+  onToggleAllowHits: (allow: boolean) => void
   onChangeTeam: () => void
   isLoading: boolean
 }
@@ -23,11 +25,13 @@ export default function HeaderBar({
   teamId,
   gameweek,
   horizon,
+  allowHits,
   bankBalance,
   isLockedGw = false,
   events = [],
   onSelectGameweek,
   onSelectHorizon,
+  onToggleAllowHits,
   onChangeTeam,
   isLoading,
 }: HeaderBarProps) {
@@ -183,30 +187,62 @@ export default function HeaderBar({
             )}
           </div>
         ) : (
-          <div className="flex items-center gap-1.5">
-            <span className="font-mono text-[9px] uppercase tracking-widest text-text-secondary mr-1">
-              PLANNING HORIZON:
-            </span>
-            {[
-              { h: 1, label: '1 GW' },
-              { h: 3, label: '3 GWs' },
-              { h: 5, label: '5 GWs' },
-            ].map(({ h, label }) => {
-              const isActive = horizon === h
-              return (
-                <button
-                  key={h}
-                  onClick={() => onSelectHorizon(h)}
-                  className={`px-2.5 py-1 rounded-sm font-mono text-xs transition-all border ${
-                    isActive
-                      ? 'bg-accent-gain/20 text-accent-gain border-accent-gain font-bold shadow-sm'
-                      : 'bg-surface-card text-text-secondary border-border-hard hover:border-accent-gain/50 hover:text-text-primary'
-                  }`}
-                >
-                  {label}
-                </button>
-              )
-            })}
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-1.5">
+              <span className="font-mono text-[9px] uppercase tracking-widest text-text-secondary mr-1">
+                PLANNING HORIZON:
+              </span>
+              {[
+                { h: 1, label: '1 GW' },
+                { h: 3, label: '3 GWs' },
+                { h: 5, label: '5 GWs' },
+              ].map(({ h, label }) => {
+                const isActive = horizon === h
+                return (
+                  <button
+                    key={h}
+                    onClick={() => onSelectHorizon(h)}
+                    className={`px-2.5 py-1 rounded-sm font-mono text-xs transition-all border ${
+                      isActive
+                        ? 'bg-accent-gain/20 text-accent-gain border-accent-gain font-bold shadow-sm'
+                        : 'bg-surface-card text-text-secondary border-border-hard hover:border-accent-gain/50 hover:text-text-primary'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="hidden sm:block w-px h-5 bg-border-hard" />
+
+            <div className="flex items-center gap-1.5">
+              <span className="font-mono text-[9px] uppercase tracking-widest text-text-secondary mr-1">
+                HITS:
+              </span>
+              <button
+                onClick={() => onToggleAllowHits(false)}
+                title="Strictly use free transfers only (no -4pt hits)"
+                className={`px-2.5 py-1 rounded-sm font-mono text-xs transition-all border ${
+                  !allowHits
+                    ? 'bg-accent-gain/20 text-accent-gain border-accent-gain font-bold shadow-sm'
+                    : 'bg-surface-card text-text-secondary border-border-hard hover:border-accent-gain/50 hover:text-text-primary'
+                }`}
+              >
+                NO HITS
+              </button>
+              <button
+                onClick={() => onToggleAllowHits(true)}
+                title="Allow at most one high-margin tactical -4pt hit"
+                className={`px-2.5 py-1 rounded-sm font-mono text-xs transition-all border ${
+                  allowHits
+                    ? 'bg-accent-loss/20 text-accent-loss border-accent-loss font-bold shadow-sm'
+                    : 'bg-surface-card text-text-secondary border-border-hard hover:border-accent-loss/50 hover:text-text-primary'
+                }`}
+              >
+                ALLOW -4
+              </button>
+            </div>
           </div>
         )}
       </div>

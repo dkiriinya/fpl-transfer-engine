@@ -13,6 +13,7 @@ interface DashboardProps {
   teamId: number
   gameweek: number
   horizon: number
+  allowHits: boolean
   events?: Array<{
     id: number
     name: string
@@ -26,6 +27,7 @@ interface DashboardProps {
   isLoading: boolean
   onSelectGameweek: (gw: number) => void
   onSelectHorizon: (h: number) => void
+  onToggleAllowHits: (allow: boolean) => void
   onChangeTeam: () => void
   onRefresh: () => void
 }
@@ -34,6 +36,7 @@ export default function Dashboard({
   teamId,
   gameweek,
   horizon,
+  allowHits,
   events = [],
   squad,
   result,
@@ -41,6 +44,7 @@ export default function Dashboard({
   isLoading,
   onSelectGameweek,
   onSelectHorizon,
+  onToggleAllowHits,
   onChangeTeam,
   onRefresh,
 }: DashboardProps) {
@@ -118,11 +122,13 @@ export default function Dashboard({
         teamId={teamId}
         gameweek={gameweek}
         horizon={horizon}
+        allowHits={allowHits}
         bankBalance={bankBalance}
         isLockedGw={isLockedGw}
         events={events}
         onSelectGameweek={onSelectGameweek}
         onSelectHorizon={onSelectHorizon}
+        onToggleAllowHits={onToggleAllowHits}
         onChangeTeam={onChangeTeam}
         isLoading={isLoading}
       />
@@ -140,6 +146,18 @@ export default function Dashboard({
               horizon={horizon}
               onSelectChip={setSelectedChip}
             />
+          )}
+
+          {/* Free Hit Revert Notification Banner */}
+          {!isLockedGw && squad.reverted_from_freehit && (
+            <div className="flex items-center gap-2.5 px-3.5 py-2.5 bg-accent-cyan/10 border border-accent-cyan/30 rounded text-xs font-mono text-accent-cyan">
+              <span className="font-bold tracking-wider uppercase bg-accent-cyan/20 px-1.5 py-0.5 rounded text-[10px]">
+                FREE HIT REVERTED
+              </span>
+              <span>
+                Free Hit chip expired after GW{squad.free_hit_gw ?? (gameweek - 1)}. Your squad has automatically reverted to your permanent pre-Free Hit team{squad.source_gw ? ` (GW${squad.source_gw})` : ''} for GW{gameweek} optimization.
+              </span>
+            </div>
           )}
 
           {/* Metrics summary bar (only for editable upcoming gameweeks) */}

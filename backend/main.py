@@ -50,7 +50,7 @@ class OptimizeRequest(BaseModel):
     chip: Optional[str] = "none"   # "none" | "wildcard" | "freehit" | "benchboost" | "triplecaptain"
     horizon: int = 1               # Planning horizon in gameweeks: 1, 3, 5
     selling_prices: Optional[Dict[int, float]] = None
-    allow_hits: bool = True        # True to allow at most 1 tactical -4pt hit; False for free transfers only
+    allow_hits: bool = False       # False for free transfers only (default); True to allow at most 1 tactical -4pt hit
     excluded_players: Optional[List[int]] = None  # Tier 3: IDs to strictly exclude from 15-man squad
     benched_players: Optional[List[int]] = None   # Tier 3: IDs forced onto the bench (x[i] == 0)
 
@@ -259,6 +259,19 @@ def get_squad_selling_prices(
     if team_id:
         try:
             with httpx.Client(timeout=10.0) as client:
+                fh_events = set()
+                try:
+                    hist_res = client.get(
+                        f"https://fantasy.premierleague.com/api/entry/{team_id}/history/",
+                        headers={"User-Agent": "FPL-Decision-Engine/1.0"}
+                    )
+                    if hist_res.is_success:
+                        for c in hist_res.json().get("chips", []):
+                            if c.get("name") == "freehit" and c.get("event"):
+                                fh_events.add(int(c["event"]))
+                except Exception as he:
+                    logger.warning(f"Failed to fetch chips history for team {team_id}: {he}")
+
                 res = client.get(
                     f"https://fantasy.premierleague.com/api/entry/{team_id}/transfers/",
                     headers={"User-Agent": "FPL-Decision-Engine/1.0"}
@@ -266,6 +279,8 @@ def get_squad_selling_prices(
                 if res.is_success:
                     transfers = res.json()
                     for t in reversed(transfers):
+                        if t.get("event") in fh_events:
+                            continue  # Ignore temporary Free Hit transfers
                         pid = t.get("element_in")
                         cost = t.get("element_in_cost")
                         if pid and cost is not None and pid not in purchase_prices:
@@ -399,6 +414,7 @@ def solve_chip_plan(
         logger.warning(f"[Solver] Could not query active leaks: {e}")
 
     is_unlimited = chip_mode in ("wildcard", "freehit") or req.wildcard_active
+    h_scale = max(1, req.horizon)
 
     if not is_unlimited:
         transfers_in = pulp.lpSum(
@@ -409,13 +425,18 @@ def solve_chip_plan(
         # Cap hits: strictly 0 hits if allow_hits is False; at most 1 hit if allow_hits is True
         max_hits = 1 if req.allow_hits else 0
         prob += h <= max_hits
-        hit_cost = h * HIT_PENALTY
+        # Horizon-adjusted hit hurdle in the objective:
+        # Taking a -4 hit today vs waiting 1 GW for next week's free transfer only buys
+        # the immediate GW advantage, not the entire 3- or 5-GW summed delta.
+        # Scale the solver's hurdle (1 GW -> 4 pts, 3 GWs -> 8 pts, 5 GWs -> 12 pts)
+        # while still reporting the exact official -4 pt deduction in net_points.
+        hit_hurdle = HIT_PENALTY * (1.0 + 0.5 * (h_scale - 1))
+        hit_cost = h * hit_hurdle
     else:
         h = 0
         hit_cost = 0
 
     # Squad continuity tiebreaker to prevent unnecessary lateral churn of active owned returners
-    h_scale = max(1, req.horizon)
     # v4: scale the minimum xP threshold for retention relative to horizon
     # For GW1: keep players with ≥3.8xP. For GW5: keep players with ≥19xP (5×3.8).
     retention_threshold = 3.8 * h_scale
@@ -590,6 +611,12 @@ def solve_chip_plan(
                 hit_cost=0,
             ))
 
+    # Sort highest-gain moves first so free transfers cover the best upgrades and any hit tags the marginal move
+    transfer_deltas.sort(key=lambda t: t.points_gain, reverse=True)
+    if not is_unlimited:
+        for idx, td in enumerate(transfer_deltas):
+            td.hit_cost = HIT_PENALTY if idx >= req.free_transfers else 0
+
     final_cost = sum(p.price for p in final_squad)
     bank_remaining = round(total_budget - final_cost, 1)
 
@@ -680,8 +707,13 @@ def evaluate_all_chips(
         except Exception as e:
             logger.warning(f"Could not fetch 4-GW pool for Wildcard lookahead: {e}")
 
+    standard_desc = (
+        "Use standard free transfers and at most 1 high-margin tactical hit for steady squad progression."
+        if req.allow_hits
+        else "Strictly free transfers only (zero -4 point hits)."
+    )
     chip_defs = [
-        ("none", "Standard Play", "Use standard free transfers and at most 1 tactical hit for steady squad progression."),
+        ("none", "Standard Play", standard_desc),
         ("wildcard", "Wildcard", "Rebuild your entire 15-man squad with zero transfer point deductions."),
         ("freehit", "Free Hit", "Completely custom 15-player squad for 1 gameweek only (reverts next GW)."),
         ("benchboost", "Bench Boost", "All 15 players in your squad score points this gameweek."),
@@ -960,7 +992,7 @@ async def health():
 
 @app.post("/optimize", response_model=OptimizeResponse)
 async def optimize(req: OptimizeRequest):
-    logger.info(f"Optimize request: team={req.team_id} gw={req.gameweek} horizon={req.horizon} ft={req.free_transfers} chip={req.chip}")
+    logger.info(f"Optimize request: team={req.team_id} gw={req.gameweek} horizon={req.horizon} ft={req.free_transfers} allow_hits={req.allow_hits} chip={req.chip}")
 
     if len(req.current_squad) != 15:
         raise HTTPException(
